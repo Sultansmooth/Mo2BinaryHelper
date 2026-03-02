@@ -607,12 +607,13 @@ class BisectEngine:
         all_indices = list(range(len(groups)))
         half_a, half_b = self._split_by_plugin_count(all_indices, groups)
 
-        # Queue: we'll test disabling half_b after half_a
+        # Disable bottom half first — bottom has patches/dependents, top has masters.
+        # Keeping top enabled means fewer missing master issues.
         work_queue = [
-            {"indices": half_b, "label": "B"},
+            {"indices": half_a, "label": "A"},
         ]
 
-        first_test = {"indices": half_a, "label": "A"}
+        first_test = {"indices": half_b, "label": "B"}
 
         # Remove cascade plugins from testable — they're always off during bisection
         # (they have 5+ testable masters and would shield those masters from being disabled)
@@ -632,14 +633,14 @@ class BisectEngine:
             "all_on_fps": all_on_fps,
             "work_queue": work_queue,
             "culprits": [],
-            "disabled_indices": half_a,
+            "disabled_indices": half_b,
             "current_test": first_test,
             "round": 0,
             "history": [],
         }
 
         # Compute enabled plugins (all testable minus disabled half)
-        enabled, actual_disabled, protected = self._compute_enabled(state, half_a)
+        enabled, actual_disabled, protected = self._compute_enabled(state, half_b)
         if protected:
             self.append_log("Protected {} masters from being disabled: {}".format(
                 len(protected), ", ".join(protected[:10])))
@@ -650,7 +651,7 @@ class BisectEngine:
         a_count = sum(len(groups[i]) for i in half_a)
         b_count = sum(len(groups[i]) for i in half_b)
         total_testable = a_count + b_count
-        msg = "{} testable plugins in {} groups.\nDisabling A ({} plugins off, {} still on).\nIf FPS is GOOD -> culprits are in the disabled group.\nIf FPS is BAD -> disabled group is clean.\nLaunch game and report result.".format(
+        msg = "{} testable plugins in {} groups.\nDisabling B (bottom half, {} plugins off, {} still on).\nIf FPS is GOOD -> culprits are in the disabled group.\nIf FPS is BAD -> disabled group is clean.\nLaunch game and report result.".format(
             total_testable, len(groups), len(actual_disabled), len(enabled))
         self.append_log(msg)
         return state, msg
@@ -759,8 +760,9 @@ class BisectEngine:
         all_indices = list(range(len(groups)))
         half_a, half_b = self._split_by_plugin_count(all_indices, groups)
 
-        work_queue = [{"indices": half_b, "label": "B"}]
-        first_test = {"indices": half_a, "label": "A"}
+        # Disable bottom half first — fewer missing master issues
+        work_queue = [{"indices": half_a, "label": "A"}]
+        first_test = {"indices": half_b, "label": "B"}
 
         # Remove cascade plugins from testable — always off during bisection
         cascade_lower = {c.lower() for c in cascade}
@@ -779,13 +781,13 @@ class BisectEngine:
             "all_on_fps": all_on_fps,
             "work_queue": work_queue,
             "culprits": [],
-            "disabled_indices": half_a,
+            "disabled_indices": half_b,
             "current_test": first_test,
             "round": 0,
             "history": [],
         }
 
-        enabled, actual_disabled, protected = self._compute_enabled(state, half_a)
+        enabled, actual_disabled, protected = self._compute_enabled(state, half_b)
         if protected:
             self.append_log("Protected {} masters from being disabled: {}".format(
                 len(protected), ", ".join(protected[:10])))
@@ -857,14 +859,15 @@ class BisectEngine:
                 sub_a, sub_b = self._split_by_plugin_count(indices, groups)
                 if sub_b:
                     can_split = True
-                    state["work_queue"].append(
-                        {"indices": sub_a, "label": test["label"] + ".A"})
+                    # Test bottom (B) before top (A) — fewer master issues
                     state["work_queue"].append(
                         {"indices": sub_b, "label": test["label"] + ".B"})
+                    state["work_queue"].append(
+                        {"indices": sub_a, "label": test["label"] + ".A"})
                     a_count = sum(len(groups[i]) for i in sub_a)
                     b_count = sum(len(groups[i]) for i in sub_b)
-                    self.append_log("  GOOD FPS -> culprits in this group, splitting into {}.A ({} plugins) and {}.B ({} plugins)".format(
-                        test["label"], a_count, test["label"], b_count))
+                    self.append_log("  GOOD FPS -> culprits in this group, splitting into {}.B ({} plugins) and {}.A ({} plugins)".format(
+                        test["label"], b_count, test["label"], a_count))
 
             if not can_split:
                 # Can't split further — this IS the culprit
@@ -991,13 +994,13 @@ class BisectEngine:
                 b_count = sum(len(groups[i]) for i in sub_b)
                 self.append_log("Round {} -- Disabled {} CRASHED ({} plugins off) -> splitting into smaller halves".format(
                     state["round"], test["label"], len(crash_plugins)))
-                self.append_log("  Trying {}.A ({} plugins) and {}.B ({} plugins) separately".format(
-                    test["label"], a_count, test["label"], b_count))
-                # Queue both sub-halves for testing
-                state["work_queue"].append(
-                    {"indices": sub_a, "label": test["label"] + ".A"})
+                self.append_log("  Trying {}.B ({} plugins) and {}.A ({} plugins) separately".format(
+                    test["label"], b_count, test["label"], a_count))
+                # Test bottom (B) before top (A) — fewer master issues
                 state["work_queue"].append(
                     {"indices": sub_b, "label": test["label"] + ".B"})
+                state["work_queue"].append(
+                    {"indices": sub_a, "label": test["label"] + ".A"})
 
         if not can_split:
             # Can't split further or crashed twice — quarantine
