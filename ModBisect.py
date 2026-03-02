@@ -1358,7 +1358,9 @@ class ModBisectDialog(QDialog):
         self.guide_toggle.setChecked(False)
         self.guide_toggle.clicked.connect(self._toggle_guide)
         layout.addWidget(self.guide_toggle)
-        self.guide_text = QLabel(
+        self.guide_text = QTextEdit()
+        self.guide_text.setReadOnly(True)
+        self.guide_text.setPlainText(
             "1. Click Start or Import List to begin\n"
             "2. Close this window (state is saved)\n"
             "3. Launch game from MO2\n"
@@ -1370,7 +1372,7 @@ class ModBisectDialog(QDialog):
             "9. Click Restore when done")
         self.guide_text.setStyleSheet(
             "background: #313244; color: #a6adc8; padding: 10px; border-radius: 4px; font-size: 11px;")
-        self.guide_text.setWordWrap(True)
+        self.guide_text.setMaximumHeight(160)
         self.guide_text.setVisible(False)
         layout.addWidget(self.guide_text)
 
@@ -1756,7 +1758,7 @@ class ModBisectDialog(QDialog):
             self.bad_btn.setText("Still Crashes")
             self.bad_btn.setToolTip("Still crashing. These aren't the problem.")
             self.crash_btn.setText("CTD on Load")
-            self.guide_text.setText(
+            self.guide_text.setPlainText(
                 "1. Click Start or Import List to begin\n"
                 "2. Close this window (state is saved)\n"
                 "3. Launch game from MO2\n"
@@ -1770,7 +1772,7 @@ class ModBisectDialog(QDialog):
             self.bad_btn.setText("Bad FPS")
             self.bad_btn.setToolTip("Still bad FPS. These aren't the problem, culprits are in what's still on.")
             self.crash_btn.setText("Crashed")
-            self.guide_text.setText(
+            self.guide_text.setPlainText(
                 "1. Click Start or Import List to begin\n"
                 "2. Close this window (state is saved)\n"
                 "3. Launch game from MO2\n"
