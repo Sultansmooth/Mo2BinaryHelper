@@ -669,7 +669,7 @@ class BisectEngine:
         a_count = sum(len(groups[i]) for i in half_a)
         b_count = sum(len(groups[i]) for i in half_b)
         total_testable = a_count + b_count
-        msg = "{} testable plugins in {} groups.\nDisabling B (bottom half, {} plugins off, {} still on).\nIf FPS is GOOD -> culprits are in the disabled group.\nIf FPS is BAD -> disabled group is clean.\nLaunch game and report result.".format(
+        msg = "{} testable plugins in {} groups.\nDisabling B (bottom half, {} plugins off, {} still on).\nIf FPS is GOOD -> culprits are in the disabled group.\nIf FPS is BAD -> culprits are in the enabled group (not these).\nLaunch game and report result.".format(
             total_testable, len(groups), len(actual_disabled), len(enabled))
         self.append_log(msg)
         return state, msg
@@ -936,7 +936,7 @@ class BisectEngine:
                 half_desc = "second half"
             else:
                 half_desc = "half"
-            msg = "Disabling {}: {} off ({} plugins disabled, {} still on).\n{} tests remaining.\nIf GOOD FPS -> culprits in disabled group.\nIf BAD FPS -> disabled group is clean.".format(
+            msg = "Disabling {}: {} off ({} plugins disabled, {} still on).\n{} tests remaining.\nIf GOOD FPS -> culprits in disabled group.\nIf BAD FPS -> culprits in enabled group (not these).".format(
                 next_test["label"], half_desc, disabled_count, len(enabled),
                 len(state["work_queue"]))
             self.append_log(msg)
@@ -1162,10 +1162,10 @@ class BisectEngine:
                     lines.append("  R{}: disabled {} ({} plugins) -> CRASHED".format(
                         h.get("round", "?"), label, n_plugins))
                 elif h.get("cost", 0) == 0 or (isinstance(h.get("cost"), (int, float)) and h["cost"] <= 5):
-                    lines.append("  R{}: disabled {} ({} plugins) -> {} FPS GOOD (culprits here!)".format(
+                    lines.append("  R{}: disabled {} ({} plugins) -> {} FPS GOOD (removing these fixed FPS)".format(
                         h.get("round", "?"), label, n_plugins, fps))
                 else:
-                    lines.append("  R{}: disabled {} ({} plugins) -> {} FPS BAD (group is clean)".format(
+                    lines.append("  R{}: disabled {} ({} plugins) -> {} FPS BAD (these aren't the problem)".format(
                         h.get("round", "?"), label, n_plugins, fps))
 
         return "\n".join(lines)
@@ -1227,14 +1227,14 @@ class ModBisectDialog(QDialog):
         result_group = QGroupBox("Report Result")
         result_layout = QHBoxLayout(result_group)
         self.good_btn = QPushButton("Good FPS")
-        self.good_btn.setToolTip("FPS improved! Culprits are in the disabled group.")
+        self.good_btn.setToolTip("FPS improved! The plugins we disabled were causing the problem.")
         self.good_btn.setStyleSheet(
             "font-size: 15px; font-weight: bold; padding: 14px;"
             "background-color: #40a02b; color: white; border-radius: 6px;")
         self.good_btn.clicked.connect(self._on_good)
         result_layout.addWidget(self.good_btn)
         self.bad_btn = QPushButton("Bad FPS")
-        self.bad_btn.setToolTip("Still bad FPS. Disabled group is clean.")
+        self.bad_btn.setToolTip("Still bad FPS. These aren't the problem, culprits are in what's still on.")
         self.bad_btn.setStyleSheet(
             "font-size: 15px; font-weight: bold; padding: 14px;"
             "background-color: #df8e1d; color: white; border-radius: 6px;")
