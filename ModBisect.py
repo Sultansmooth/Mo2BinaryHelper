@@ -1201,6 +1201,8 @@ class BisectEngine:
             shutil.copy2(self.plugins_file, self.plugins_backup)
         if not os.path.exists(self.modlist_backup) and os.path.exists(self.modlist_file):
             shutil.copy2(self.modlist_file, self.modlist_backup)
+        if not os.path.exists(self.loadorder_backup) and os.path.exists(self.loadorder_file):
+            shutil.copy2(self.loadorder_file, self.loadorder_backup)
 
         # Read current plugins.txt, disable matching ones
         with open(self.plugins_file, "r", encoding="utf-8-sig") as f:
