@@ -34,6 +34,9 @@ DEFAULT_EXCLUDE_PATTERNS = [
     "address library",
     "high fps",
     "addictol",
+    "buffout",
+    "classic holstered",
+    "unofficial fallout 4 patch",
 ]
 
 
@@ -48,9 +51,11 @@ class BisectEngine:
         self._organizer = organizer
         self.plugins_file = os.path.join(profile_dir, "plugins.txt")
         self.modlist_file = os.path.join(profile_dir, "modlist.txt")
+        self.loadorder_file = os.path.join(profile_dir, "loadorder.txt")
         self.state_file = os.path.join(profile_dir, "bisect_state.json")
         self.plugins_backup = self.plugins_file + ".bisect_backup"
         self.modlist_backup = self.modlist_file + ".bisect_backup"
+        self.loadorder_backup = self.loadorder_file + ".bisect_backup"
         self.log_file = os.path.join(profile_dir, "bisect_log.txt")
         self._plugin_to_mod = {}
         self._plugin_paths = {}  # plugin_lower -> file path (fallback only)
@@ -173,10 +178,17 @@ class BisectEngine:
         all_lower = {p.lower(): p for p in all_plugins}
 
         # First pass: identify directly excluded plugins
+        # Check both mod folder name AND plugin name against exclude patterns
         base_set = set(BASE_PLUGINS)
         excluded_mods = set()
         for p in all_plugins:
-            if p.lower() in self._plugin_to_mod:
+            # Check plugin name itself (e.g. "Unofficial Fallout 4 Patch.esp")
+            if self._is_excluded_mod(p):
+                base_set.add(p.lower())
+                mod_folder = self._plugin_to_mod.get(p.lower(), p)
+                excluded_mods.add(mod_folder)
+            # Check mod folder name
+            elif p.lower() in self._plugin_to_mod:
                 mod_folder = self._plugin_to_mod[p.lower()]
                 if self._is_excluded_mod(mod_folder):
                     base_set.add(p.lower())
@@ -364,15 +376,18 @@ class BisectEngine:
 
     def backup_files(self):
         for src, dst in [(self.plugins_file, self.plugins_backup),
-                         (self.modlist_file, self.modlist_backup)]:
-            if not os.path.exists(dst):
+                         (self.modlist_file, self.modlist_backup),
+                         (self.loadorder_file, self.loadorder_backup)]:
+            if os.path.exists(src) and not os.path.exists(dst):
                 shutil.copy2(src, dst)
 
     def restore_backups(self):
         # Restore modlist (left pane) FIRST so mods are enabled
-        # before their plugins come back in plugins.txt
+        # before their plugins come back in plugins.txt,
+        # then plugins.txt, then loadorder.txt to fix right pane order
         for dst, src in [(self.modlist_file, self.modlist_backup),
-                         (self.plugins_file, self.plugins_backup)]:
+                         (self.plugins_file, self.plugins_backup),
+                         (self.loadorder_file, self.loadorder_backup)]:
             if os.path.exists(src):
                 shutil.copy2(src, dst)
                 os.remove(src)
@@ -436,19 +451,38 @@ class BisectEngine:
     def append_log(self, message):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         entry = "[{}] {}".format(ts, message)
-        with open(self.log_file, "a") as f:
+        with open(self.log_file, "a", encoding="utf-8") as f:
             f.write(entry + "\n")
         return entry
 
     def read_log(self):
         if os.path.exists(self.log_file):
-            with open(self.log_file, "r") as f:
+            with open(self.log_file, "r", encoding="utf-8", errors="replace") as f:
                 return f.read()
         return ""
 
     def clear_log(self):
         if os.path.exists(self.log_file):
             os.remove(self.log_file)
+
+    @staticmethod
+    def _split_by_plugin_count(indices, groups):
+        """Split indices into two halves balanced by plugin count, not group count."""
+        total = sum(len(groups[i]) for i in indices)
+        target = total // 2
+        running = 0
+        split_at = 1  # at least 1 in first half
+        for idx, i in enumerate(indices):
+            running += len(groups[i])
+            if running >= target:
+                split_at = idx + 1
+                break
+        # Ensure both halves are non-empty
+        if split_at >= len(indices):
+            split_at = len(indices) - 1
+        if split_at < 1:
+            split_at = 1
+        return indices[:split_at], indices[split_at:]
 
     # --- Commands ---
 
@@ -500,11 +534,9 @@ class BisectEngine:
         # Backup
         self.backup_files()
 
-        # Start bisecting — split into two halves, test first half
+        # Start bisecting — split into two halves by plugin count, test first half
         all_indices = list(range(len(groups)))
-        half = len(all_indices) // 2
-        half_a = all_indices[:half]
-        half_b = all_indices[half:]
+        half_a, half_b = self._split_by_plugin_count(all_indices, groups)
 
         work_queue = [
             {"indices": half_b, "label": "B"},
@@ -541,8 +573,9 @@ class BisectEngine:
         self.save_state(state)
 
         total_testable = sum(len(g) for g in groups)
-        msg = "{} testable plugins in {} groups.\nTesting A ({} groups, {} plugins).\nLaunch game and report FPS.".format(
-            total_testable, len(groups), len(half_a), len(plugins))
+        disabled_count = total_testable - len(plugins)
+        msg = "{} testable plugins in {} groups.\nTesting A: ONLY first half enabled ({} plugins on, {} off).\nIf FPS is bad → killers are in this half.\nIf FPS is good → this half is clean.\nLaunch game and report FPS.".format(
+            total_testable, len(groups), len(plugins), disabled_count)
         self.append_log(msg)
         return state, msg
 
@@ -572,6 +605,15 @@ class BisectEngine:
         self.append_log("Round {} — {} = {} FPS (cost: {} FPS, {} groups)".format(
             state["round"], test["label"], fps, fps_cost, len(indices)))
 
+        # Log plugins — only list individually when group is small enough to be useful
+        test_plugins = []
+        for i in indices:
+            for p in groups[i]:
+                test_plugins.append(p)
+        if len(test_plugins) <= 50:
+            self.append_log("  Plugins ({}): {}".format(
+                len(test_plugins), ", ".join(test_plugins)))
+
         state["history"].append({
             "round": state["round"],
             "label": test["label"],
@@ -581,19 +623,22 @@ class BisectEngine:
         })
 
         if fps_cost > 5 and len(indices) > self.THRESHOLD:
-            half = len(indices) // 2
-            sub_a = indices[:half]
-            sub_b = indices[half:]
+            sub_a, sub_b = self._split_by_plugin_count(indices, groups)
             state["work_queue"].append(
                 {"indices": sub_a, "label": test["label"] + ".A"})
             state["work_queue"].append(
                 {"indices": sub_b, "label": test["label"] + ".B"})
-            self.append_log("  Splitting {} further".format(test["label"]))
+            a_count = sum(len(groups[i]) for i in sub_a)
+            b_count = sum(len(groups[i]) for i in sub_b)
+            self.append_log("  BAD FPS → splitting {} into {}.A ({} plugins) and {}.B ({} plugins)".format(
+                test["label"], test["label"], a_count, test["label"], b_count))
 
         elif fps_cost > 5 and len(indices) <= self.THRESHOLD:
             group_names = []
+            total_in_group = 0
             for i in indices:
                 g = groups[i]
+                total_in_group += len(g)
                 if len(g) == 1:
                     group_names.append(g[0])
                 else:
@@ -603,10 +648,16 @@ class BisectEngine:
                 "names": group_names,
                 "fps_cost": fps_cost,
             })
-            self.append_log("  CULPRIT: {} (costs {} FPS)".format(
-                ", ".join(group_names), fps_cost))
+            if total_in_group > 20:
+                self.append_log("  CULPRIT GROUP: {} ({} plugins, costs {} FPS)".format(
+                    ", ".join(group_names), total_in_group, fps_cost))
+                self.append_log("  NOTE: Large group — add '{}' to excludes and re-run to bisect inside it".format(
+                    groups[indices[0]][0]))
+            else:
+                self.append_log("  CULPRIT: {} (costs {} FPS)".format(
+                    ", ".join(group_names), fps_cost))
         else:
-            self.append_log("  Clean (cost <= 5 FPS)")
+            self.append_log("  CLEAN → no FPS killers in this group")
 
         # Next task
         if state["work_queue"]:
@@ -622,8 +673,16 @@ class BisectEngine:
             state["enabled_indices"] = next_indices
             self.save_state(state)
 
-            msg = "Testing {} ({} groups, {} plugins).\n{} tests remaining.".format(
-                next_test["label"], len(next_indices), len(plugins),
+            # Build a human-readable description of what this test means
+            depth = len(next_test["label"])  # e.g. "A.B.A" = deep split
+            if next_test["label"].endswith(".A"):
+                half_desc = "first half"
+            elif next_test["label"].endswith(".B"):
+                half_desc = "second half"
+            else:
+                half_desc = "half"
+            msg = "Testing {}: ONLY {} enabled ({} plugins on).\n{} tests remaining.\nIf bad FPS → killers are in this group. If good → this group is clean.".format(
+                next_test["label"], half_desc, len(plugins),
                 len(state["work_queue"]))
             self.append_log(msg)
             return state, msg
@@ -646,6 +705,109 @@ class BisectEngine:
                     len(state["culprits"]))
             else:
                 msg = "Done. No single group costs more than 5 FPS."
+                self.append_log(msg)
+
+            return state, msg
+
+    def report_crash(self):
+        """Quarantine the current test group as a suspect and move on. No splitting."""
+        state = self.load_state()
+        if not state:
+            return None, "No bisection in progress."
+
+        groups = state["groups"]
+        deps = state["all_deps"]
+        base = state["base_plugins"]
+        all_testable = state.get("all_testable", [])
+        all_masters_map = state.get("all_masters", {})
+        base_set = {p.lower() for p in base}
+        self._plugin_to_mod = state.get("plugin_to_mod", {})
+
+        if state.get("phase") != "testing":
+            return state, "Bisection is not in testing phase."
+
+        test = state["current_test"]
+        indices = test["indices"]
+
+        state["round"] += 1
+
+        # Build names for the crashed group
+        group_names = []
+        for i in indices:
+            g = groups[i]
+            if len(g) == 1:
+                group_names.append(g[0])
+            else:
+                group_names.append("{} (+{})".format(g[0], len(g) - 1))
+
+        state["culprits"].append({
+            "indices": indices,
+            "names": group_names,
+            "fps_cost": "CRASHED",
+        })
+
+        state["history"].append({
+            "round": state["round"],
+            "label": test["label"],
+            "groups": len(indices),
+            "fps": "CRASH",
+            "cost": "CRASHED",
+        })
+
+        # Log which plugins were in the crashed group
+        crash_plugins = []
+        for i in indices:
+            for p in groups[i]:
+                crash_plugins.append(p)
+        self.append_log("Round {} — {} CRASHED ({} groups, {} plugins) → QUARANTINED as suspect".format(
+            state["round"], test["label"], len(indices), len(crash_plugins)))
+        if len(crash_plugins) <= 50:
+            self.append_log("  Quarantined plugins: {}".format(
+                ", ".join(crash_plugins)))
+        else:
+            self.append_log("  Quarantined: {} plugins (too many to list — narrow down further)".format(
+                len(crash_plugins)))
+
+        # Move to next test
+        if state["work_queue"]:
+            next_test = state["work_queue"].pop(0)
+            next_indices = next_test["indices"]
+            plugins = self.order_plugins([groups[i] for i in next_indices], deps)
+            plugins, pulled = self.close_under_masters(plugins, all_testable, all_masters_map, base_set)
+            if pulled:
+                self.append_log("  Pulled in {} masters: {}".format(
+                    len(pulled), ", ".join(pulled[:5])))
+            self.write_plugins(base, plugins)
+            state["current_test"] = next_test
+            state["enabled_indices"] = next_indices
+            self.save_state(state)
+
+            if next_test["label"].endswith(".A"):
+                half_desc = "first half"
+            elif next_test["label"].endswith(".B"):
+                half_desc = "second half"
+            else:
+                half_desc = "half"
+            msg = "Crashed group quarantined.\nTesting {}: ONLY {} enabled ({} plugins on).\n{} tests remaining.\nIf bad FPS → killers are in this group. If good → this group is clean.".format(
+                next_test["label"], half_desc, len(plugins),
+                len(state["work_queue"]))
+            self.append_log(msg)
+            return state, msg
+        else:
+            self.write_plugins(base, [])
+            state["phase"] = "done"
+            state["enabled_indices"] = []
+            self.save_state(state)
+
+            if state["culprits"]:
+                self.append_log("=== RESULTS ===")
+                for c in sorted(state["culprits"], key=lambda x: str(x["fps_cost"]), reverse=True):
+                    self.append_log("  -{}: {}".format(
+                        c["fps_cost"], ", ".join(c["names"])))
+                msg = "Done! Found {} suspect(s). Check the log.".format(
+                    len(state["culprits"]))
+            else:
+                msg = "Done. No culprits found."
                 self.append_log(msg)
 
             return state, msg
@@ -677,7 +839,22 @@ class BisectEngine:
                 state.get("baseline_fps", "?"), state.get("all_on_fps", "?")))
             lines.append("Tests remaining: {}".format(len(state.get("work_queue", []))))
             if state.get("culprits"):
-                lines.append("Culprits found so far: {}".format(len(state["culprits"])))
+                lines.append("")
+                lines.append("Suspects so far ({}):".format(len(state["culprits"])))
+                for c in state["culprits"]:
+                    cost = c["fps_cost"]
+                    all_plugins = []
+                    for i in c.get("indices", []):
+                        if i < len(groups):
+                            for p in groups[i]:
+                                all_plugins.append(p)
+                    if cost == "CRASHED":
+                        lines.append("  CRASHED: {} ({} plugins)".format(
+                            c["names"][0] if c["names"] else "?", len(all_plugins)))
+                    else:
+                        lines.append("  -{} FPS: {} ({} plugins)".format(
+                            cost, c["names"][0] if c["names"] else "?", len(all_plugins)))
+                lines.append("(Use 'Copy Suspects' for full list)")
         elif phase == "done":
             lines.append("Phase: COMPLETE")
             lines.append("Baseline: {} FPS | All on: {} FPS".format(
@@ -685,17 +862,33 @@ class BisectEngine:
             if state.get("culprits"):
                 lines.append("")
                 lines.append("FPS Killers Found:")
-                for c in sorted(state["culprits"], key=lambda x: x["fps_cost"], reverse=True):
-                    lines.append("  -{} FPS: {}".format(
-                        c["fps_cost"], ", ".join(c["names"])))
+                for c in sorted(state["culprits"], key=lambda x: str(x["fps_cost"]), reverse=True):
+                    total_in = sum(len(groups[i]) for i in c.get("indices", []) if i < len(groups))
+                    if total_in > 20:
+                        lines.append("  -{} FPS: {} ({} plugins — add root to excludes, re-run)".format(
+                            c["fps_cost"], c["names"][0] if c["names"] else "?", total_in))
+                    else:
+                        lines.append("  -{}: {}".format(
+                            c["fps_cost"], ", ".join(c["names"])))
+                lines.append("")
+                lines.append("Use 'Copy Suspects' or 'Save Log' for full details.")
 
         if state.get("history"):
             lines.append("")
-            lines.append("History:")
-            for h in state["history"][-10:]:
-                lines.append("  R{}: {} = {} FPS (cost {})".format(
-                    h.get("round", "?"), h.get("label", "?"),
-                    h.get("fps", "?"), h.get("cost", "?")))
+            lines.append("Summary:")
+            for h in state["history"]:
+                fps = h.get("fps", "?")
+                label = h.get("label", "?")
+                groups = h.get("groups", "?")
+                if fps == "CRASH":
+                    lines.append("  R{}: {} ({} groups) -> CRASHED (quarantined)".format(
+                        h.get("round", "?"), label, groups))
+                elif h.get("cost", 0) == 0 or (isinstance(h.get("cost"), (int, float)) and h["cost"] <= 5):
+                    lines.append("  R{}: {} ({} groups) -> {} FPS CLEAN".format(
+                        h.get("round", "?"), label, groups, fps))
+                else:
+                    lines.append("  R{}: {} ({} groups) -> {} FPS BAD (cost {})".format(
+                        h.get("round", "?"), label, groups, fps, h.get("cost", "?")))
 
         return "\n".join(lines)
 
@@ -746,28 +939,48 @@ class ModBisectDialog(QDialog):
         setup_layout.addWidget(self.setup_btn)
         layout.addWidget(setup_group)
 
-        # FPS input + submit
-        fps_group = QGroupBox("Report FPS")
-        fps_layout = QHBoxLayout(fps_group)
-        fps_layout.addWidget(QLabel("FPS:"))
-        self.fps_input = QSpinBox()
-        self.fps_input.setRange(1, 999)
-        self.fps_input.setValue(60)
-        self.fps_input.setStyleSheet("font-size: 18px; padding: 8px; min-width: 100px;")
-        fps_layout.addWidget(self.fps_input)
-        self.submit_btn = QPushButton("Submit FPS")
-        self.submit_btn.setStyleSheet(
-            "font-size: 15px; font-weight: bold; padding: 12px;"
-            "background-color: #1e66f5; color: white; border-radius: 6px;")
-        self.submit_btn.clicked.connect(self._on_submit_fps)
-        fps_layout.addWidget(self.submit_btn)
+        # Report result buttons
+        result_group = QGroupBox("Report Result")
+        result_layout = QHBoxLayout(result_group)
+        self.good_btn = QPushButton("Good FPS")
+        self.good_btn.setStyleSheet(
+            "font-size: 15px; font-weight: bold; padding: 14px;"
+            "background-color: #40a02b; color: white; border-radius: 6px;")
+        self.good_btn.clicked.connect(self._on_good)
+        result_layout.addWidget(self.good_btn)
+        self.bad_btn = QPushButton("Bad FPS")
+        self.bad_btn.setStyleSheet(
+            "font-size: 15px; font-weight: bold; padding: 14px;"
+            "background-color: #df8e1d; color: white; border-radius: 6px;")
+        self.bad_btn.clicked.connect(self._on_bad)
+        result_layout.addWidget(self.bad_btn)
         self.crash_btn = QPushButton("Crashed")
         self.crash_btn.setStyleSheet(
-            "font-size: 13px; font-weight: bold; padding: 12px;"
+            "font-size: 15px; font-weight: bold; padding: 14px;"
             "background-color: #d20f39; color: white; border-radius: 6px;")
         self.crash_btn.clicked.connect(self._on_crash)
-        fps_layout.addWidget(self.crash_btn)
-        layout.addWidget(fps_group)
+        result_layout.addWidget(self.crash_btn)
+        layout.addWidget(result_group)
+
+        # Suspects actions
+        suspects_layout = QHBoxLayout()
+        self.copy_suspects_btn = QPushButton("Copy Suspects")
+        self.copy_suspects_btn.setStyleSheet("font-size: 11px; padding: 6px;")
+        self.copy_suspects_btn.clicked.connect(self._copy_suspects)
+        suspects_layout.addWidget(self.copy_suspects_btn)
+        self.disable_suspects_btn = QPushButton("Disable Suspects")
+        self.disable_suspects_btn.setToolTip("Disable all suspect plugins in plugins.txt")
+        self.disable_suspects_btn.setStyleSheet("font-size: 11px; padding: 6px;")
+        self.disable_suspects_btn.clicked.connect(self._disable_suspects)
+        suspects_layout.addWidget(self.disable_suspects_btn)
+        self.rebisect_btn = QPushButton("Re-bisect Suspects")
+        self.rebisect_btn.setToolTip("Restore, exclude the group root, and re-run to split large groups")
+        self.rebisect_btn.setStyleSheet(
+            "font-size: 11px; padding: 6px; font-weight: bold;"
+            "background-color: #7c3aed; color: white; border-radius: 4px;")
+        self.rebisect_btn.clicked.connect(self._rebisect_suspects)
+        suspects_layout.addWidget(self.rebisect_btn)
+        layout.addLayout(suspects_layout)
 
         # Restore
         self.restore_btn = QPushButton("Restore Original Files")
@@ -775,26 +988,37 @@ class ModBisectDialog(QDialog):
         self.restore_btn.clicked.connect(self._on_restore)
         layout.addWidget(self.restore_btn)
 
-        # Separator
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        layout.addWidget(sep)
+        # Collapsible log section
+        self.log_toggle = QPushButton(">> Test Log")
+        self.log_toggle.setStyleSheet(
+            "font-weight: bold; font-size: 11px; padding: 4px; text-align: left; border: none;")
+        self.log_toggle.setCheckable(True)
+        self.log_toggle.setChecked(False)
+        self.log_toggle.clicked.connect(self._toggle_log)
+        layout.addWidget(self.log_toggle)
 
-        # Log
-        log_label = QLabel("Test Log:")
-        log_label.setStyleSheet("font-weight: bold;")
-        layout.addWidget(log_label)
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setFont(QFont("Consolas", 9))
         self.log_text.setStyleSheet(
             "background: #1e1e2e; color: #a6adc8; padding: 6px; border-radius: 4px;")
+        self.log_text.setVisible(False)
         layout.addWidget(self.log_text)
 
-        copy_btn = QPushButton("Copy Log to Clipboard")
+        log_btns = QHBoxLayout()
+        copy_btn = QPushButton("Copy Log")
         copy_btn.setStyleSheet("font-size: 11px; padding: 5px;")
         copy_btn.clicked.connect(self._copy_log)
-        layout.addWidget(copy_btn)
+        self.copy_log_btn = copy_btn
+        self.copy_log_btn.setVisible(False)
+        log_btns.addWidget(self.copy_log_btn)
+        save_btn = QPushButton("Save Log to Desktop")
+        save_btn.setStyleSheet("font-size: 11px; padding: 5px;")
+        save_btn.clicked.connect(self._save_to_desktop)
+        self.save_log_btn = save_btn
+        self.save_log_btn.setVisible(False)
+        log_btns.addWidget(self.save_log_btn)
+        layout.addLayout(log_btns)
 
     def _refresh(self):
         state = self.engine.load_state()
@@ -805,15 +1029,32 @@ class ModBisectDialog(QDialog):
         self.setup_btn.setEnabled(not has_state)
         self.baseline_input.setEnabled(not has_state)
         self.allon_input.setEnabled(not has_state)
-        self.submit_btn.setEnabled(in_progress)
-        self.fps_input.setEnabled(in_progress)
+        self.good_btn.setEnabled(in_progress)
+        self.bad_btn.setEnabled(in_progress)
         self.crash_btn.setEnabled(in_progress)
         self.restore_btn.setEnabled(has_state)
 
+        has_suspects = bool(state and state.get("culprits"))
+        is_done = has_state and phase == "done"
+        self.copy_suspects_btn.setEnabled(has_suspects)
+        self.disable_suspects_btn.setEnabled(has_suspects)
+        # Re-bisect only when done and has large suspect groups
+        has_large = False
+        if has_suspects:
+            groups_data = state.get("groups", [])
+            for c in state["culprits"]:
+                total = sum(len(groups_data[i]) for i in c.get("indices", []) if i < len(groups_data))
+                if total > 20:
+                    has_large = True
+                    break
+        self.rebisect_btn.setEnabled(is_done and has_large)
+
         self.status_label.setText(self.engine.get_status_text())
         self.log_text.setPlainText(self.engine.read_log())
-        sb = self.log_text.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        if self.log_text.isVisible():
+            QApplication.processEvents()
+            sb = self.log_text.verticalScrollBar()
+            sb.setValue(sb.maximum())
 
     def _on_setup(self):
         baseline = self.baseline_input.value()
@@ -842,37 +1083,44 @@ class ModBisectDialog(QDialog):
             self._try_refresh_mo2()
         self._refresh()
 
-    def _on_submit_fps(self):
-        fps = self.fps_input.value()
+    def _on_good(self):
+        state = self.engine.load_state()
+        fps = state["baseline_fps"] if state else 150
         state, msg = self.engine.report_fps(fps)
         if state and state.get("phase") == "done":
             QMessageBox.information(self, "Complete", msg)
         else:
             QMessageBox.information(self, "Next Test",
-                msg + "\n\nLaunch the game, note your FPS, then enter it here.")
+                msg + "\n\nLaunch the game and report the result.")
+            self._try_refresh_mo2()
+        self._refresh()
+
+    def _on_bad(self):
+        state = self.engine.load_state()
+        fps = state["all_on_fps"] if state else 50
+        state, msg = self.engine.report_fps(fps)
+        if state and state.get("phase") == "done":
+            QMessageBox.information(self, "Complete", msg)
+        else:
+            QMessageBox.information(self, "Next Test",
+                msg + "\n\nLaunch the game and report the result.")
             self._try_refresh_mo2()
         self._refresh()
 
     def _on_crash(self):
         reply = QMessageBox.question(
             self, "Game Crashed",
-            "Retry same test, or skip this group?\n\n"
+            "Retry same test, or quarantine this group?\n\n"
             "Retry = same plugins, test again\n"
-            "Skip = treat as bad FPS, keep splitting",
+            "Quarantine = mark as suspect, skip to next test",
             QMessageBox.StandardButton.Retry | QMessageBox.StandardButton.Ignore,
         )
-        state = self.engine.load_state()
-        if not state:
-            return
-        test = state.get("current_test", {})
-        self.engine.append_log("CRASHED (testing {})".format(test.get("label", "?")))
-
         if reply == QMessageBox.StandardButton.Retry:
-            self.engine.append_log("  Retrying same test")
+            self.engine.append_log("CRASHED — Retrying same test")
             QMessageBox.information(self, "Retry",
                 "Same plugins still enabled. Launch game and try again.")
         else:
-            state, msg = self.engine.report_fps(0)
+            state, msg = self.engine.report_crash()
             if state and state.get("phase") == "done":
                 QMessageBox.information(self, "Complete", msg)
             else:
@@ -898,6 +1146,146 @@ class ModBisectDialog(QDialog):
             self.organizer.refresh()
         except Exception:
             pass
+
+    def _toggle_log(self):
+        show = self.log_toggle.isChecked()
+        self.log_text.setVisible(show)
+        self.copy_log_btn.setVisible(show)
+        self.save_log_btn.setVisible(show)
+        self.log_toggle.setText("vv Test Log" if show else ">> Test Log")
+        if show:
+            QApplication.processEvents()
+            sb = self.log_text.verticalScrollBar()
+            sb.setValue(sb.maximum())
+
+    def _get_suspect_plugins(self):
+        """Get list of all plugins from culprit groups."""
+        state = self.engine.load_state()
+        if not state or not state.get("culprits"):
+            return []
+        groups = state.get("groups", [])
+        plugins = []
+        for c in state["culprits"]:
+            for i in c.get("indices", []):
+                if i < len(groups):
+                    for p in groups[i]:
+                        plugins.append(p)
+        return plugins
+
+    def _copy_suspects(self):
+        plugins = self._get_suspect_plugins()
+        if not plugins:
+            QMessageBox.information(self, "No Suspects", "No suspects found yet.")
+            return
+        text = "Suspect plugins ({}):\n".format(len(plugins))
+        for p in plugins:
+            text += "  {}\n".format(p)
+        QApplication.clipboard().setText(text)
+        QMessageBox.information(self, "Copied",
+            "{} suspect plugins copied to clipboard.".format(len(plugins)))
+
+    def _disable_suspects(self):
+        plugins = self._get_suspect_plugins()
+        if not plugins:
+            QMessageBox.information(self, "No Suspects", "No suspects found yet.")
+            return
+        reply = QMessageBox.question(
+            self, "Disable Suspects",
+            "Disable {} suspect plugins in plugins.txt?\n\n"
+            "This will remove the * prefix from these plugins.\n"
+            "Use Restore to undo.".format(len(plugins)),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        # Read plugins.txt, remove * from suspects
+        suspect_lower = {p.lower() for p in plugins}
+        with open(self.engine.plugins_file, "r", encoding="utf-8-sig") as f:
+            lines = f.readlines()
+        with open(self.engine.plugins_file, "w", encoding="utf-8") as f:
+            disabled = 0
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("*"):
+                    name = stripped[1:]
+                    if name.lower() in suspect_lower:
+                        f.write("{}\n".format(name))
+                        disabled += 1
+                        continue
+                f.write(line)
+        self.engine.sync_modlist([])  # will disable mods with no enabled plugins
+        self._try_refresh_mo2()
+        self.engine.append_log("Disabled {} suspect plugins.".format(disabled))
+        QMessageBox.information(self, "Done",
+            "Disabled {} suspect plugins.".format(disabled))
+        self._refresh()
+
+    def _rebisect_suspects(self):
+        """Restore, add large group roots to excludes, and restart bisection."""
+        state = self.engine.load_state()
+        if not state or not state.get("culprits"):
+            return
+        groups = state.get("groups", [])
+        # Find root plugins of large culprit groups
+        roots = []
+        for c in state["culprits"]:
+            total = sum(len(groups[i]) for i in c.get("indices", []) if i < len(groups))
+            if total > 20 and c.get("indices"):
+                root_group = groups[c["indices"][0]]
+                if root_group:
+                    roots.append(root_group[0])
+        if not roots:
+            QMessageBox.information(self, "No Large Groups",
+                "No large suspect groups found to re-bisect.")
+            return
+        # Show what we'll exclude
+        root_names = ", ".join(roots)
+        reply = QMessageBox.question(
+            self, "Re-bisect Suspects",
+            "This will:\n"
+            "1. Restore original files\n"
+            "2. Add these to excludes: {}\n"
+            "3. Start a new bisection\n\n"
+            "The large groups will break into smaller testable pieces.\n"
+            "Continue?".format(root_names),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        baseline = state.get("baseline_fps", 150)
+        allon = state.get("all_on_fps", 50)
+        # Restore
+        self.engine.restore_backups()
+        self._try_refresh_mo2()
+        # Add roots to exclude patterns
+        for r in roots:
+            # Use the plugin name without extension as pattern
+            name_no_ext = os.path.splitext(r)[0].lower()
+            if name_no_ext not in [p.lower() for p in self.engine.exclude_patterns]:
+                self.engine.exclude_patterns.append(name_no_ext)
+        # Re-run setup
+        state, msg = self.engine.setup(baseline, allon)
+        if state is None:
+            QMessageBox.warning(self, "Error", msg)
+        else:
+            QMessageBox.information(self, "Re-bisect Started",
+                "Excluded: {}\n\n{}\n\nLaunch game and report result.".format(
+                    root_names, msg))
+            self._try_refresh_mo2()
+        self._refresh()
+
+    def _save_to_desktop(self):
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(desktop, "bisect_log_{}.txt".format(ts))
+        log = self.engine.read_log()
+        # Append suspects summary
+        suspects = self._get_suspect_plugins()
+        if suspects:
+            log += "\n\n=== SUSPECT PLUGINS ({}) ===\n".format(len(suspects))
+            for p in suspects:
+                log += "  {}\n".format(p)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(log)
+        QMessageBox.information(self, "Saved", "Log saved to:\n{}".format(path))
 
     def _copy_log(self):
         QApplication.clipboard().setText(self.log_text.toPlainText())
