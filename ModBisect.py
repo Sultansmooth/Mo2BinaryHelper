@@ -239,6 +239,19 @@ class BisectEngine:
             if len(masters) >= 5:
                 cascade_keys.add(key)
 
+        # Also cascade any plugin that depends on a cascade plugin (transitively).
+        # Otherwise it'd have missing masters since cascade is always disabled.
+        changed = True
+        while changed:
+            changed = False
+            for key, masters in all_masters.items():
+                if key not in cascade_keys and key in testable_lower:
+                    for m in masters:
+                        if m in cascade_keys:
+                            cascade_keys.add(key)
+                            changed = True
+                            break
+
         filtered = [s for s in testable if s.lower() not in cascade_keys]
         cascade = [s for s in testable if s.lower() in cascade_keys]
         filtered_set = {s.lower() for s in filtered}
