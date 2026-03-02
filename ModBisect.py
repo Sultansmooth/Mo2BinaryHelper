@@ -936,7 +936,9 @@ class BisectEngine:
             return state, msg
 
     def report_crash(self):
-        """Quarantine the current disabled group as a suspect and move on."""
+        """Handle crash: split the crashed group into smaller halves instead of
+        quarantining immediately. Only quarantine if the group can't be split
+        (single group) or has already crashed twice at this level."""
         state = self.load_state()
         if not state:
             return None, "No bisection in progress."
@@ -953,26 +955,14 @@ class BisectEngine:
 
         test = state["current_test"]
         indices = test["indices"]
+        crash_count = test.get("crash_count", 0) + 1
 
         state["round"] += 1
 
-        # Build names for the crashed group
-        group_names = []
         crash_plugins = []
         for i in indices:
-            g = groups[i]
-            for p in g:
+            for p in groups[i]:
                 crash_plugins.append(p)
-            if len(g) == 1:
-                group_names.append(g[0])
-            else:
-                group_names.append("{} (+{})".format(g[0], len(g) - 1))
-
-        state["culprits"].append({
-            "indices": indices,
-            "names": group_names,
-            "fps_cost": "CRASHED",
-        })
 
         state["history"].append({
             "round": state["round"],
@@ -983,14 +973,47 @@ class BisectEngine:
             "cost": "CRASHED",
         })
 
-        self.append_log("Round {} -- Disabled {} CRASHED ({} groups, {} plugins off) -> QUARANTINED".format(
-            state["round"], test["label"], len(indices), len(crash_plugins)))
-        if len(crash_plugins) <= 50:
-            self.append_log("  Disabled plugins: {}".format(
-                ", ".join(crash_plugins)))
-        else:
-            self.append_log("  Disabled: {} plugins (too many to list)".format(
-                len(crash_plugins)))
+        # Try to split instead of quarantine (unless too small or crashed twice)
+        can_split = False
+        if crash_count < 2 and len(indices) > self.THRESHOLD:
+            sub_a, sub_b = self._split_by_plugin_count(indices, groups)
+            if sub_b:
+                can_split = True
+                a_count = sum(len(groups[i]) for i in sub_a)
+                b_count = sum(len(groups[i]) for i in sub_b)
+                self.append_log("Round {} -- Disabled {} CRASHED ({} plugins off) -> splitting into smaller halves".format(
+                    state["round"], test["label"], len(crash_plugins)))
+                self.append_log("  Crash #{} -- trying {}.A ({} plugins) and {}.B ({} plugins) separately".format(
+                    crash_count, test["label"], a_count, test["label"], b_count))
+                # Queue both sub-halves for testing
+                state["work_queue"].append(
+                    {"indices": sub_a, "label": test["label"] + ".A"})
+                state["work_queue"].append(
+                    {"indices": sub_b, "label": test["label"] + ".B"})
+
+        if not can_split:
+            # Can't split further or crashed twice — quarantine
+            group_names = []
+            for i in indices:
+                g = groups[i]
+                if len(g) == 1:
+                    group_names.append(g[0])
+                else:
+                    group_names.append("{} (+{})".format(g[0], len(g) - 1))
+
+            state["culprits"].append({
+                "indices": indices,
+                "names": group_names,
+                "fps_cost": "CRASHED",
+            })
+
+            self.append_log("Round {} -- Disabled {} CRASHED ({} plugins off) -> QUARANTINED".format(
+                state["round"], test["label"], len(crash_plugins)))
+            if len(crash_plugins) <= 50:
+                self.append_log("  Quarantined: {}".format(", ".join(crash_plugins)))
+            else:
+                self.append_log("  Quarantined: {} plugins (too many to list)".format(
+                    len(crash_plugins)))
 
         # Move to next test
         if state["work_queue"]:
@@ -1012,8 +1035,9 @@ class BisectEngine:
                 half_desc = "second half"
             else:
                 half_desc = "half"
-            msg = "Crashed group quarantined.\nDisabling {}: {} ({} plugins off, {} on).\n{} tests remaining.".format(
-                next_test["label"], half_desc, len(actual_disabled), len(enabled),
+            action = "Split crashed group" if can_split else "Crashed group quarantined"
+            msg = "{}.\nDisabling {}: {} ({} plugins off, {} on).\n{} tests remaining.".format(
+                action, next_test["label"], half_desc, len(actual_disabled), len(enabled),
                 len(state["work_queue"]))
             self.append_log(msg)
             return state, msg
@@ -1375,13 +1399,29 @@ class ModBisectDialog(QDialog):
         self._refresh()
 
     def _on_crash(self):
-        reply = QMessageBox.question(
-            self, "Game Crashed",
-            "Retry same test, or quarantine this group?\n\n"
-            "Retry = same plugins, test again\n"
-            "Quarantine = mark as suspect, skip to next test",
-            QMessageBox.StandardButton.Retry | QMessageBox.StandardButton.Ignore,
-        )
+        # Check current group size to give appropriate message
+        state = self.engine.load_state()
+        indices = state.get("current_test", {}).get("indices", []) if state else []
+        groups = state.get("groups", []) if state else []
+        plugin_count = sum(len(groups[i]) for i in indices if i < len(groups))
+        can_split = len(indices) > self.engine.THRESHOLD
+
+        if can_split:
+            reply = QMessageBox.question(
+                self, "Game Crashed",
+                "Retry same test, or split into smaller halves?\n\n"
+                "Retry = same plugins disabled, test again\n"
+                "Split = try disabling smaller portions instead",
+                QMessageBox.StandardButton.Retry | QMessageBox.StandardButton.Ignore,
+            )
+        else:
+            reply = QMessageBox.question(
+                self, "Game Crashed",
+                "Retry same test, or quarantine this group?\n\n"
+                "Retry = same plugins disabled, test again\n"
+                "Quarantine = mark as suspect, skip to next test",
+                QMessageBox.StandardButton.Retry | QMessageBox.StandardButton.Ignore,
+            )
         if reply == QMessageBox.StandardButton.Retry:
             self.engine.append_log("CRASHED -- Retrying same test")
             QMessageBox.information(self, "Retry",
