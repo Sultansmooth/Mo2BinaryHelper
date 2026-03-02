@@ -41,7 +41,6 @@ DEFAULT_EXCLUDE_PATTERNS = [
     "classic holstered",
     "classicholstered",
     "unofficial fallout 4 patch",
-    "workshopframework",
 ]
 
 
