@@ -41,6 +41,7 @@ DEFAULT_EXCLUDE_PATTERNS = [
     "classic holstered",
     "classicholstered",
     "unofficial fallout 4 patch",
+    "workshopframework",
 ]
 
 
@@ -516,26 +517,36 @@ class BisectEngine:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         desktop = os.path.join(os.path.expanduser("~"), "Desktop")
         dest = os.path.join(desktop, "bisect_results_{}.txt".format(ts))
-        shutil.copy2(self.log_file, dest)
-        self.append_log("Results saved to: {}".format(dest))
+        try:
+            shutil.copy2(self.log_file, dest)
+            self.append_log("Results saved to: {}".format(dest))
+        except Exception as e:
+            self.append_log("ERROR saving results: {}".format(e))
         # Also save a clean importable plugin list for re-bisecting
-        state = self.load_state()
-        if state and state.get("culprits"):
-            groups = state.get("groups", [])
-            plugins = []
-            for c in state["culprits"]:
-                for i in c.get("indices", []):
-                    if i < len(groups):
-                        for p in groups[i]:
-                            plugins.append(p)
-            if plugins:
-                list_dest = os.path.join(desktop, "bisect_suspects_{}.txt".format(ts))
-                with open(list_dest, "w", encoding="utf-8") as f:
-                    f.write("# Bisect suspects - import this file to re-bisect\n")
-                    for p in plugins:
-                        f.write("{}\n".format(p))
-                self.append_log("Suspect list saved to: {} ({} plugins — use Import to re-bisect)".format(
-                    list_dest, len(plugins)))
+        try:
+            state = self.load_state()
+            if state and state.get("culprits"):
+                groups = state.get("groups", [])
+                plugins = []
+                for c in state["culprits"]:
+                    for i in c.get("indices", []):
+                        if i < len(groups):
+                            for p in groups[i]:
+                                plugins.append(p)
+                if plugins:
+                    list_dest = os.path.join(desktop, "bisect_suspects_{}.txt".format(ts))
+                    with open(list_dest, "w", encoding="utf-8") as f:
+                        f.write("# Bisect suspects - import this file to re-bisect\n")
+                        for p in plugins:
+                            f.write("{}\n".format(p))
+                    self.append_log("Suspect list saved to: {} ({} plugins — use Import to re-bisect)".format(
+                        list_dest, len(plugins)))
+                else:
+                    self.append_log("WARNING: No plugins found in culprit groups for suspect list")
+            else:
+                self.append_log("WARNING: No state/culprits found for suspect list")
+        except Exception as e:
+            self.append_log("ERROR saving suspect list: {}".format(e))
 
     @staticmethod
     def _split_by_plugin_count(indices, groups):
