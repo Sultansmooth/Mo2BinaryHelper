@@ -1,8 +1,11 @@
 """
-MO2 Mod Bisect Tool v3
-Find FPS-killing plugins via binary search.
+MO2 Mod Bisect Tool v4
+Find FPS-killing plugins via subtractive binary search.
 Reads your full load order — no suspects file needed.
 Syncs both plugins.txt (right pane) and modlist.txt (left pane).
+
+Subtractive approach: disables one half at a time (keeps most plugins on).
+Fewer master issues, works for cumulative FPS problems.
 """
 
 import os
@@ -269,18 +272,20 @@ class BisectEngine:
 
         return list(groups.values()), cascade, deps, all_masters, not_found
 
-    def close_under_masters(self, enabled_plugins, all_testable, all_masters, base_set):
-        """Ensure all masters of enabled plugins are also enabled.
+    def protect_masters(self, disabled_plugins, all_testable, all_masters, base_set):
+        """Prevent disabling plugins that are masters of enabled plugins.
 
-        Only pulls in masters from the testable set (plugins that were
-        in plugins.txt). Won't enable plugins the user never had enabled.
+        In subtractive bisection, we disable a subset. But if an enabled plugin
+        needs a disabled plugin as a master, we must keep that master enabled
+        (remove it from the disabled set).
 
-        Returns (closed_list, pulled_in) where pulled_in are extra plugins
-        that had to be added to satisfy dependencies.
+        Returns (actual_disabled, protected) where protected are plugins that
+        were kept enabled to satisfy dependencies.
         """
         testable_lower = {p.lower(): p for p in all_testable}
-        enabled = {p.lower() for p in enabled_plugins}
-        pulled_in = set()
+        disabled = {p.lower() for p in disabled_plugins}
+        enabled = {p.lower() for p in all_testable if p.lower() not in disabled}
+        protected = set()
 
         changed = True
         while changed:
@@ -289,23 +294,24 @@ class BisectEngine:
                 # Check cached masters first, then live API as fallback
                 masters = all_masters.get(plugin, [])
                 if not masters:
-                    # Cached map was empty — try live lookup
                     orig_name = testable_lower.get(plugin, plugin)
                     live = self.get_plugin_masters(orig_name)
                     if live:
                         masters = [m.lower() for m in live]
-                        all_masters[plugin] = masters  # cache for next pass
+                        all_masters[plugin] = masters
                 for master_l in masters:
                     if master_l in base_set:
                         continue  # base plugin, always on
-                    if master_l in testable_lower and master_l not in enabled:
+                    if master_l in disabled:
+                        # This master is needed — keep it enabled
+                        disabled.remove(master_l)
                         enabled.add(master_l)
-                        pulled_in.add(master_l)
+                        protected.add(master_l)
                         changed = True
 
-        closed = [testable_lower[p] for p in enabled if p in testable_lower]
-        pulled_names = [testable_lower[p] for p in pulled_in if p in testable_lower]
-        return closed, pulled_names
+        actual_disabled = [testable_lower[p] for p in disabled if p in testable_lower]
+        protected_names = [testable_lower[p] for p in protected if p in testable_lower]
+        return actual_disabled, protected_names
 
     def sync_modlist(self, enabled_plugins):
         """Sync modlist.txt left pane to match enabled plugins.
@@ -523,10 +529,34 @@ class BisectEngine:
         split_at = max(1, min(split_at, len(indices) - 1))
         return indices[:split_at], indices[split_at:]
 
+    def _compute_enabled(self, state, disabled_indices):
+        """Compute the enabled testable plugins for a subtractive test.
+
+        All testable plugins EXCEPT those in disabled_indices groups are enabled.
+        Then protect_masters keeps any disabled plugin that's needed as a master.
+        """
+        groups = state["groups"]
+        all_testable = state.get("all_testable", [])
+        all_masters_map = state.get("all_masters", {})
+        base = state["base_plugins"]
+        base_set = {p.lower() for p in base}
+
+        disabled_set = set()
+        for i in disabled_indices:
+            for p in groups[i]:
+                disabled_set.add(p.lower())
+
+        disabled_plugins = [p for p in all_testable if p.lower() in disabled_set]
+        actual_disabled, protected = self.protect_masters(
+            disabled_plugins, all_testable, all_masters_map, base_set)
+
+        enabled = [p for p in all_testable if p.lower() not in {d.lower() for d in actual_disabled}]
+        return enabled, actual_disabled, protected
+
     # --- Commands ---
 
     def setup(self, baseline_fps, all_on_fps):
-        """Start bisection. User provides FPS values upfront — no test rounds wasted."""
+        """Start subtractive bisection. Disables one half at a time."""
         if self.has_state():
             return None, "Bisection already in progress. Restore first to start over."
 
@@ -541,7 +571,7 @@ class BisectEngine:
         groups, cascade, deps, all_masters, not_found = self.build_dependency_groups(testable)
 
         self.clear_log()
-        self.append_log("=== MO2 Mod Bisect v3 Started ===")
+        self.append_log("=== MO2 Mod Bisect v4 (Subtractive) Started ===")
         self.append_log("Profile: {}".format(os.path.basename(self.profile_dir)))
         self.append_log("Total plugins: {} ({} base/excluded, {} testable, {} cascade)".format(
             len(all_plugins), len(base), len(testable) - len(cascade), len(cascade)))
@@ -573,23 +603,16 @@ class BisectEngine:
         # Backup
         self.backup_files()
 
-        # Start bisecting — split into two halves by plugin count, test first half
+        # Start bisecting — split into two halves, DISABLE first half
         all_indices = list(range(len(groups)))
         half_a, half_b = self._split_by_plugin_count(all_indices, groups)
 
+        # Queue: we'll test disabling half_b after half_a
         work_queue = [
             {"indices": half_b, "label": "B"},
         ]
 
         first_test = {"indices": half_a, "label": "A"}
-        plugins = self.order_plugins([groups[i] for i in half_a], deps)
-        # Close under masters — pull in any missing dependencies
-        base_set = {p.lower() for p in base}
-        plugins, pulled = self.close_under_masters(plugins, testable, all_masters, base_set)
-        if pulled:
-            self.append_log("Pulled in {} extra plugins for masters: {}".format(
-                len(pulled), ", ".join(pulled[:10])))
-        self.write_plugins(base, plugins)
 
         state = {
             "base_plugins": base,
@@ -604,22 +627,31 @@ class BisectEngine:
             "all_on_fps": all_on_fps,
             "work_queue": work_queue,
             "culprits": [],
-            "enabled_indices": half_a,
+            "disabled_indices": half_a,
             "current_test": first_test,
             "round": 0,
             "history": [],
         }
+
+        # Compute enabled plugins (all testable minus disabled half)
+        enabled, actual_disabled, protected = self._compute_enabled(state, half_a)
+        if protected:
+            self.append_log("Protected {} masters from being disabled: {}".format(
+                len(protected), ", ".join(protected[:10])))
+        self.write_plugins(base, enabled)
+
         self.save_state(state)
 
-        total_testable = sum(len(g) for g in groups)
-        disabled_count = total_testable - len(plugins)
-        msg = "{} testable plugins in {} groups.\nTesting A: ONLY first half enabled ({} plugins on, {} off).\nIf FPS is bad → killers are in this half.\nIf FPS is good → this half is clean.\nLaunch game and report FPS.".format(
-            total_testable, len(groups), len(plugins), disabled_count)
+        a_count = sum(len(groups[i]) for i in half_a)
+        b_count = sum(len(groups[i]) for i in half_b)
+        total_testable = a_count + b_count
+        msg = "{} testable plugins in {} groups.\nDisabling A ({} plugins off, {} still on).\nIf FPS is GOOD -> culprits are in the disabled group.\nIf FPS is BAD -> disabled group is clean.\nLaunch game and report result.".format(
+            total_testable, len(groups), len(actual_disabled), len(enabled))
         self.append_log(msg)
         return state, msg
 
     def setup_from_list(self, baseline_fps, all_on_fps, suspect_file):
-        """Start bisection using only plugins from a file as testable."""
+        """Start subtractive bisection using only plugins from a file as testable."""
         if self.has_state():
             return None, "Bisection already in progress. Restore first to start over."
 
@@ -686,7 +718,7 @@ class BisectEngine:
         groups, cascade, deps, all_masters, not_found = self.build_dependency_groups(testable)
 
         self.clear_log()
-        self.append_log("=== MO2 Mod Bisect v3 Started (imported {} suspects) ===".format(len(testable)))
+        self.append_log("=== MO2 Mod Bisect v4 (Subtractive, imported {} suspects) ===".format(len(testable)))
         self.append_log("Profile: {}".format(os.path.basename(self.profile_dir)))
         if excluded_from_import:
             self.append_log("Auto-excluded {} imported plugins (frameworks):".format(len(excluded_from_import)))
@@ -724,13 +756,6 @@ class BisectEngine:
 
         work_queue = [{"indices": half_b, "label": "B"}]
         first_test = {"indices": half_a, "label": "A"}
-        plugins = self.order_plugins([groups[i] for i in half_a], deps)
-        base_set = {p.lower() for p in base}
-        plugins, pulled = self.close_under_masters(plugins, testable, all_masters, base_set)
-        if pulled:
-            self.append_log("Pulled in {} extra plugins for masters: {}".format(
-                len(pulled), ", ".join(pulled[:10])))
-        self.write_plugins(base, plugins)
 
         state = {
             "base_plugins": base,
@@ -745,27 +770,39 @@ class BisectEngine:
             "all_on_fps": all_on_fps,
             "work_queue": work_queue,
             "culprits": [],
-            "enabled_indices": half_a,
+            "disabled_indices": half_a,
             "current_test": first_test,
             "round": 0,
             "history": [],
         }
+
+        enabled, actual_disabled, protected = self._compute_enabled(state, half_a)
+        if protected:
+            self.append_log("Protected {} masters from being disabled: {}".format(
+                len(protected), ", ".join(protected[:10])))
+        self.write_plugins(base, enabled)
         self.save_state(state)
 
         total_testable = sum(len(g) for g in groups)
-        disabled_count = total_testable - len(plugins)
-        msg = "{} suspects imported, {} testable in {} groups.\nTesting A ({} plugins on, {} off).\nLaunch game and report result.".format(
-            len(testable), total_testable, len(groups), len(plugins), disabled_count)
+        msg = "{} suspects imported, {} testable in {} groups.\nDisabling A ({} plugins off, {} still on).\nLaunch game and report result.".format(
+            len(testable), total_testable, len(groups), len(actual_disabled), len(enabled))
         self.append_log(msg)
         return state, msg
 
     def report_fps(self, fps):
+        """Report FPS result for current subtractive test.
+
+        Subtractive logic:
+        - Good FPS (cost <= 5): removing the disabled group FIXED the problem.
+          Culprits are IN the disabled group. Split it further.
+        - Bad FPS (cost > 5): removing the disabled group DIDN'T HELP.
+          The disabled group is CLEAN. Move on.
+        """
         state = self.load_state()
         if not state:
             return None, "No bisection in progress."
 
         groups = state["groups"]
-        deps = state["all_deps"]
         base = state["base_plugins"]
         all_testable = state.get("all_testable", [])
         all_masters_map = state.get("all_masters", {})
@@ -782,126 +819,129 @@ class BisectEngine:
         fps_cost = baseline - fps
 
         state["round"] += 1
-        self.append_log("Round {} — {} = {} FPS (cost: {} FPS, {} groups)".format(
-            state["round"], test["label"], fps, fps_cost, len(indices)))
+        self.append_log("Round {} -- Disabled {} = {} FPS (cost: {} FPS, {} groups, {} plugins off)".format(
+            state["round"], test["label"], fps, fps_cost, len(indices),
+            sum(len(groups[i]) for i in indices)))
 
-        # Log plugins — only list individually when group is small enough to be useful
+        # Log disabled plugins when group is small enough
         test_plugins = []
         for i in indices:
             for p in groups[i]:
                 test_plugins.append(p)
         if len(test_plugins) <= 50:
-            self.append_log("  Plugins ({}): {}".format(
-                len(test_plugins), ", ".join(test_plugins)))
+            self.append_log("  Disabled: {}".format(", ".join(test_plugins)))
 
         state["history"].append({
             "round": state["round"],
             "label": test["label"],
             "groups": len(indices),
+            "plugins": len(test_plugins),
             "fps": fps,
             "cost": fps_cost,
         })
 
-        can_split = False
-        if fps_cost > 5 and len(indices) > self.THRESHOLD:
-            sub_a, sub_b = self._split_by_plugin_count(indices, groups)
-            if sub_b:  # only split if both halves are non-empty
-                can_split = True
-                state["work_queue"].append(
-                    {"indices": sub_a, "label": test["label"] + ".A"})
-                state["work_queue"].append(
-                    {"indices": sub_b, "label": test["label"] + ".B"})
-                a_count = sum(len(groups[i]) for i in sub_a)
-                b_count = sum(len(groups[i]) for i in sub_b)
-                self.append_log("  BAD FPS → splitting {} into {}.A ({} plugins) and {}.B ({} plugins)".format(
-                    test["label"], test["label"], a_count, test["label"], b_count))
+        # SUBTRACTIVE: Good FPS means culprits are in the disabled group
+        if fps_cost <= 5:
+            # Good FPS — removing this group fixed the problem
+            can_split = False
+            if len(indices) > self.THRESHOLD:
+                sub_a, sub_b = self._split_by_plugin_count(indices, groups)
+                if sub_b:
+                    can_split = True
+                    state["work_queue"].append(
+                        {"indices": sub_a, "label": test["label"] + ".A"})
+                    state["work_queue"].append(
+                        {"indices": sub_b, "label": test["label"] + ".B"})
+                    a_count = sum(len(groups[i]) for i in sub_a)
+                    b_count = sum(len(groups[i]) for i in sub_b)
+                    self.append_log("  GOOD FPS -> culprits in this group, splitting into {}.A ({} plugins) and {}.B ({} plugins)".format(
+                        test["label"], a_count, test["label"], b_count))
 
-        if fps_cost > 5 and not can_split:
-            group_names = []
-            total_in_group = 0
-            for i in indices:
-                g = groups[i]
-                total_in_group += len(g)
-                if len(g) == 1:
-                    group_names.append(g[0])
+            if not can_split:
+                # Can't split further — this IS the culprit
+                group_names = []
+                total_in_group = 0
+                for i in indices:
+                    g = groups[i]
+                    total_in_group += len(g)
+                    if len(g) == 1:
+                        group_names.append(g[0])
+                    else:
+                        group_names.append("{} (+{})".format(g[0], len(g) - 1))
+                state["culprits"].append({
+                    "indices": indices,
+                    "names": group_names,
+                    "fps_cost": fps_cost,
+                })
+                if total_in_group > 20:
+                    self.append_log("  CULPRIT GROUP: {} ({} plugins)".format(
+                        ", ".join(group_names), total_in_group))
+                    self.append_log("  NOTE: Large group -- add '{}' to excludes and re-run to bisect inside it".format(
+                        groups[indices[0]][0]))
                 else:
-                    group_names.append("{} (+{})".format(g[0], len(g) - 1))
-            state["culprits"].append({
-                "indices": indices,
-                "names": group_names,
-                "fps_cost": fps_cost,
-            })
-            if total_in_group > 20:
-                self.append_log("  CULPRIT GROUP: {} ({} plugins, costs {} FPS)".format(
-                    ", ".join(group_names), total_in_group, fps_cost))
-                self.append_log("  NOTE: Large group — add '{}' to excludes and re-run to bisect inside it".format(
-                    groups[indices[0]][0]))
-            else:
-                self.append_log("  CULPRIT: {} (costs {} FPS)".format(
-                    ", ".join(group_names), fps_cost))
+                    self.append_log("  CULPRIT: {} (removing fixes FPS)".format(
+                        ", ".join(group_names)))
         else:
-            self.append_log("  CLEAN → no FPS killers in this group")
+            # Bad FPS — removing this group didn't help, it's clean
+            self.append_log("  BAD FPS -> this group is CLEAN, culprits are elsewhere")
 
         # Next task
         if state["work_queue"]:
             next_test = state["work_queue"].pop(0)
             next_indices = next_test["indices"]
-            plugins = self.order_plugins([groups[i] for i in next_indices], deps)
-            plugins, pulled = self.close_under_masters(plugins, all_testable, all_masters_map, base_set)
-            if pulled:
-                self.append_log("  Pulled in {} masters: {}".format(
-                    len(pulled), ", ".join(pulled[:5])))
-            self.write_plugins(base, plugins)
+
+            enabled, actual_disabled, protected = self._compute_enabled(state, next_indices)
+            if protected:
+                self.append_log("  Protected {} masters: {}".format(
+                    len(protected), ", ".join(protected[:5])))
+            self.write_plugins(base, enabled)
             state["current_test"] = next_test
-            state["enabled_indices"] = next_indices
+            state["disabled_indices"] = next_indices
             self.save_state(state)
 
-            # Build a human-readable description of what this test means
-            depth = len(next_test["label"])  # e.g. "A.B.A" = deep split
+            disabled_count = len(actual_disabled)
             if next_test["label"].endswith(".A"):
                 half_desc = "first half"
             elif next_test["label"].endswith(".B"):
                 half_desc = "second half"
             else:
                 half_desc = "half"
-            msg = "Testing {}: ONLY {} enabled ({} plugins on).\n{} tests remaining.\nIf bad FPS → killers are in this group. If good → this group is clean.".format(
-                next_test["label"], half_desc, len(plugins),
+            msg = "Disabling {}: {} off ({} plugins disabled, {} still on).\n{} tests remaining.\nIf GOOD FPS -> culprits in disabled group.\nIf BAD FPS -> disabled group is clean.".format(
+                next_test["label"], half_desc, disabled_count, len(enabled),
                 len(state["work_queue"]))
             self.append_log(msg)
             return state, msg
         else:
-            self.write_plugins(base, [])
+            # All done — re-enable everything
+            self.write_plugins(base, all_testable)
             state["phase"] = "done"
-            state["enabled_indices"] = []
+            state["disabled_indices"] = []
             self.save_state(state)
 
             if state["culprits"]:
                 self.append_log("=== RESULTS ===")
                 total_found = 0
                 for c in sorted(state["culprits"], key=lambda x: x["fps_cost"] if isinstance(x["fps_cost"], (int, float)) else 9999, reverse=True):
-                    self.append_log("  -{} FPS: {}".format(
-                        c["fps_cost"], ", ".join(c["names"])))
+                    self.append_log("  CULPRIT: {}".format(", ".join(c["names"])))
                     if isinstance(c["fps_cost"], (int, float)):
                         total_found += c["fps_cost"]
-                self.append_log("Total: {} FPS of {} FPS total cost".format(
-                    total_found, baseline - state["all_on_fps"]))
+                self.append_log("Found {} culprit(s).".format(len(state["culprits"])))
                 msg = "Done! Found {} culprit(s). Check the log.".format(
                     len(state["culprits"]))
                 self._auto_save_log()
             else:
-                msg = "Done. No single group costs more than 5 FPS."
+                msg = "Done. No single group causes the FPS drop alone.\nThe problem may be cumulative (too many plugins total)."
                 self.append_log(msg)
 
             return state, msg
 
     def report_crash(self):
-        """Quarantine the current test group as a suspect and move on. No splitting."""
+        """Quarantine the current disabled group as a suspect and move on."""
         state = self.load_state()
         if not state:
             return None, "No bisection in progress."
 
         groups = state["groups"]
-        deps = state["all_deps"]
         base = state["base_plugins"]
         all_testable = state.get("all_testable", [])
         all_masters_map = state.get("all_masters", {})
@@ -918,8 +958,11 @@ class BisectEngine:
 
         # Build names for the crashed group
         group_names = []
+        crash_plugins = []
         for i in indices:
             g = groups[i]
+            for p in g:
+                crash_plugins.append(p)
             if len(g) == 1:
                 group_names.append(g[0])
             else:
@@ -935,36 +978,32 @@ class BisectEngine:
             "round": state["round"],
             "label": test["label"],
             "groups": len(indices),
+            "plugins": len(crash_plugins),
             "fps": "CRASH",
             "cost": "CRASHED",
         })
 
-        # Log which plugins were in the crashed group
-        crash_plugins = []
-        for i in indices:
-            for p in groups[i]:
-                crash_plugins.append(p)
-        self.append_log("Round {} — {} CRASHED ({} groups, {} plugins) → QUARANTINED as suspect".format(
+        self.append_log("Round {} -- Disabled {} CRASHED ({} groups, {} plugins off) -> QUARANTINED".format(
             state["round"], test["label"], len(indices), len(crash_plugins)))
         if len(crash_plugins) <= 50:
-            self.append_log("  Quarantined plugins: {}".format(
+            self.append_log("  Disabled plugins: {}".format(
                 ", ".join(crash_plugins)))
         else:
-            self.append_log("  Quarantined: {} plugins (too many to list — narrow down further)".format(
+            self.append_log("  Disabled: {} plugins (too many to list)".format(
                 len(crash_plugins)))
 
         # Move to next test
         if state["work_queue"]:
             next_test = state["work_queue"].pop(0)
             next_indices = next_test["indices"]
-            plugins = self.order_plugins([groups[i] for i in next_indices], deps)
-            plugins, pulled = self.close_under_masters(plugins, all_testable, all_masters_map, base_set)
-            if pulled:
-                self.append_log("  Pulled in {} masters: {}".format(
-                    len(pulled), ", ".join(pulled[:5])))
-            self.write_plugins(base, plugins)
+
+            enabled, actual_disabled, protected = self._compute_enabled(state, next_indices)
+            if protected:
+                self.append_log("  Protected {} masters: {}".format(
+                    len(protected), ", ".join(protected[:5])))
+            self.write_plugins(base, enabled)
             state["current_test"] = next_test
-            state["enabled_indices"] = next_indices
+            state["disabled_indices"] = next_indices
             self.save_state(state)
 
             if next_test["label"].endswith(".A"):
@@ -973,21 +1012,21 @@ class BisectEngine:
                 half_desc = "second half"
             else:
                 half_desc = "half"
-            msg = "Crashed group quarantined.\nTesting {}: ONLY {} enabled ({} plugins on).\n{} tests remaining.\nIf bad FPS → killers are in this group. If good → this group is clean.".format(
-                next_test["label"], half_desc, len(plugins),
+            msg = "Crashed group quarantined.\nDisabling {}: {} ({} plugins off, {} on).\n{} tests remaining.".format(
+                next_test["label"], half_desc, len(actual_disabled), len(enabled),
                 len(state["work_queue"]))
             self.append_log(msg)
             return state, msg
         else:
-            self.write_plugins(base, [])
+            self.write_plugins(base, all_testable)
             state["phase"] = "done"
-            state["enabled_indices"] = []
+            state["disabled_indices"] = []
             self.save_state(state)
 
             if state["culprits"]:
                 self.append_log("=== RESULTS ===")
                 for c in sorted(state["culprits"], key=lambda x: x["fps_cost"] if isinstance(x["fps_cost"], (int, float)) else 9999, reverse=True):
-                    self.append_log("  -{}: {}".format(
+                    self.append_log("  {}: {}".format(
                         c["fps_cost"], ", ".join(c["names"])))
                 msg = "Done! Found {} suspect(s). Check the log.".format(
                     len(state["culprits"]))
@@ -1019,8 +1058,9 @@ class BisectEngine:
         if phase == "testing":
             test = state.get("current_test", {})
             n_groups = len(test.get("indices", []))
-            lines.append("Phase: Testing '{}'  ({} groups)".format(
-                test.get("label", "?"), n_groups))
+            disabled_count = sum(len(groups[i]) for i in test.get("indices", []) if i < len(groups))
+            lines.append("Phase: Disabling '{}' ({} groups, {} plugins off)".format(
+                test.get("label", "?"), n_groups, disabled_count))
             lines.append("Baseline: {} FPS | All on: {} FPS".format(
                 state.get("baseline_fps", "?"), state.get("all_on_fps", "?")))
             lines.append("Tests remaining: {}".format(len(state.get("work_queue", []))))
@@ -1038,8 +1078,8 @@ class BisectEngine:
                         lines.append("  CRASHED: {} ({} plugins)".format(
                             c["names"][0] if c["names"] else "?", len(all_plugins)))
                     else:
-                        lines.append("  -{} FPS: {} ({} plugins)".format(
-                            cost, c["names"][0] if c["names"] else "?", len(all_plugins)))
+                        lines.append("  CULPRIT: {} ({} plugins)".format(
+                            c["names"][0] if c["names"] else "?", len(all_plugins)))
                 lines.append("(Use 'Copy Suspects' for full list)")
         elif phase == "done":
             lines.append("Phase: COMPLETE")
@@ -1051,11 +1091,10 @@ class BisectEngine:
                 for c in sorted(state["culprits"], key=lambda x: x["fps_cost"] if isinstance(x["fps_cost"], (int, float)) else 9999, reverse=True):
                     total_in = sum(len(groups[i]) for i in c.get("indices", []) if i < len(groups))
                     if total_in > 20:
-                        lines.append("  -{} FPS: {} ({} plugins — add root to excludes, re-run)".format(
-                            c["fps_cost"], c["names"][0] if c["names"] else "?", total_in))
+                        lines.append("  CULPRIT: {} ({} plugins -- add root to excludes, re-run)".format(
+                            c["names"][0] if c["names"] else "?", total_in))
                     else:
-                        lines.append("  -{}: {}".format(
-                            c["fps_cost"], ", ".join(c["names"])))
+                        lines.append("  CULPRIT: {}".format(", ".join(c["names"])))
                 lines.append("")
                 lines.append("Use 'Copy Suspects' or 'Save Log' for full details.")
 
@@ -1065,16 +1104,16 @@ class BisectEngine:
             for h in state["history"]:
                 fps = h.get("fps", "?")
                 label = h.get("label", "?")
-                n_grp = h.get("groups", "?")
+                n_plugins = h.get("plugins", h.get("groups", "?"))
                 if fps == "CRASH":
-                    lines.append("  R{}: {} ({} groups) -> CRASHED (quarantined)".format(
-                        h.get("round", "?"), label, n_grp))
+                    lines.append("  R{}: disabled {} ({} plugins) -> CRASHED".format(
+                        h.get("round", "?"), label, n_plugins))
                 elif h.get("cost", 0) == 0 or (isinstance(h.get("cost"), (int, float)) and h["cost"] <= 5):
-                    lines.append("  R{}: {} ({} groups) -> {} FPS CLEAN".format(
-                        h.get("round", "?"), label, n_grp, fps))
+                    lines.append("  R{}: disabled {} ({} plugins) -> {} FPS GOOD (culprits here!)".format(
+                        h.get("round", "?"), label, n_plugins, fps))
                 else:
-                    lines.append("  R{}: {} ({} groups) -> {} FPS BAD (cost {})".format(
-                        h.get("round", "?"), label, n_grp, fps, h.get("cost", "?")))
+                    lines.append("  R{}: disabled {} ({} plugins) -> {} FPS BAD (group is clean)".format(
+                        h.get("round", "?"), label, n_plugins, fps))
 
         return "\n".join(lines)
 
@@ -1084,7 +1123,7 @@ class ModBisectDialog(QDialog):
         super().__init__(parent)
         self.engine = engine
         self.organizer = organizer
-        self.setWindowTitle("Mod Bisect v3 - Find FPS Killers")
+        self.setWindowTitle("Mod Bisect v4 - Find FPS Killers")
         self.setMinimumWidth(580)
         self.setMinimumHeight(560)
         self._build_ui()
@@ -1134,12 +1173,14 @@ class ModBisectDialog(QDialog):
         result_group = QGroupBox("Report Result")
         result_layout = QHBoxLayout(result_group)
         self.good_btn = QPushButton("Good FPS")
+        self.good_btn.setToolTip("FPS improved! Culprits are in the disabled group.")
         self.good_btn.setStyleSheet(
             "font-size: 15px; font-weight: bold; padding: 14px;"
             "background-color: #40a02b; color: white; border-radius: 6px;")
         self.good_btn.clicked.connect(self._on_good)
         result_layout.addWidget(self.good_btn)
         self.bad_btn = QPushButton("Bad FPS")
+        self.bad_btn.setToolTip("Still bad FPS. Disabled group is clean.")
         self.bad_btn.setStyleSheet(
             "font-size: 15px; font-weight: bold; padding: 14px;"
             "background-color: #df8e1d; color: white; border-radius: 6px;")
@@ -1293,7 +1334,8 @@ class ModBisectDialog(QDialog):
             "Good FPS: {}  |  Bad FPS: {}\n"
             "FPS cost to find: {} FPS\n\n"
             "This will back up your files and start bisecting\n"
-            "your entire load order. Continue?".format(
+            "your entire load order (subtractive — disables halves).\n"
+            "Continue?".format(
                 baseline, allon, baseline - allon),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply != QMessageBox.StandardButton.Yes:
@@ -1303,8 +1345,8 @@ class ModBisectDialog(QDialog):
             QMessageBox.warning(self, "Error", msg)
         else:
             QMessageBox.information(self, "Ready",
-                msg + "\n\nLaunch the game, note your FPS, then\n"
-                "come back and enter it here.")
+                msg + "\n\nLaunch the game, check your FPS, then\n"
+                "come back and click Good or Bad.")
             self._try_refresh_mo2()
         self._refresh()
 
@@ -1341,16 +1383,16 @@ class ModBisectDialog(QDialog):
             QMessageBox.StandardButton.Retry | QMessageBox.StandardButton.Ignore,
         )
         if reply == QMessageBox.StandardButton.Retry:
-            self.engine.append_log("CRASHED — Retrying same test")
+            self.engine.append_log("CRASHED -- Retrying same test")
             QMessageBox.information(self, "Retry",
-                "Same plugins still enabled. Launch game and try again.")
+                "Same plugins still disabled. Launch game and try again.")
         else:
             state, msg = self.engine.report_crash()
             if state and state.get("phase") == "done":
                 QMessageBox.information(self, "Complete", msg)
             else:
                 QMessageBox.information(self, "Next Test",
-                    msg + "\n\nLaunch the game, note your FPS, then enter it here.")
+                    msg + "\n\nLaunch the game and report result.")
                 self._try_refresh_mo2()
         self._refresh()
 
@@ -1538,12 +1580,12 @@ class ModBisectPlugin(mobase.IPluginTool):
 
     def description(self):
         return self.tr(
-            "Find FPS-killing plugins via binary search. "
-            "Bisects your entire load order. "
+            "Find FPS-killing plugins via subtractive binary search. "
+            "Disables halves to isolate culprits. "
             "Syncs both left pane (mods) and right pane (plugins).")
 
     def version(self):
-        return mobase.VersionInfo(3, 0, 0, 0)
+        return mobase.VersionInfo(4, 0, 0, 0)
 
     def settings(self):
         return [
@@ -1557,7 +1599,7 @@ class ModBisectPlugin(mobase.IPluginTool):
         return self.tr("Mod Bisect Tool")
 
     def tooltip(self):
-        return self.tr("Find FPS-killing plugins via binary search")
+        return self.tr("Find FPS-killing plugins via subtractive binary search")
 
     def icon(self):
         return QIcon()
