@@ -1123,6 +1123,40 @@ class BisectEngine:
         self.append_log("=== Restored original files ===")
         return "Restored. Profile is back to pre-bisection state."
 
+    def export_group(self, root_plugin):
+        """Build dependency groups from current load order and export the group
+        containing root_plugin to a file on the Desktop."""
+        enabled = self.read_enabled_plugins()
+        base = [p for p in enabled if p.lower() in BASE_PLUGINS or self._is_excluded(p)]
+        testable = [p for p in enabled if p not in base]
+        groups, cascade, deps, all_masters, not_found = self.build_dependency_groups(testable)
+
+        # Find the group containing root_plugin
+        root_lower = root_plugin.lower()
+        found_group = None
+        for g in groups:
+            if any(p.lower() == root_lower for p in g):
+                found_group = g
+                break
+        # Also check cascade
+        if found_group is None:
+            for p in cascade:
+                if p.lower() == root_lower:
+                    # Root is in cascade — collect all cascade plugins that share it
+                    found_group = [p for p in cascade]
+                    break
+        if found_group is None:
+            return None, "Plugin '{}' not found in any dependency group.\nMake sure it's enabled in your load order.".format(root_plugin)
+
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        safe_name = root_plugin.replace(".", "_").replace(" ", "_")
+        dest = os.path.join(desktop, "bisect_group_{}.txt".format(safe_name))
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write("# Dependency group for {} ({} plugins)\n".format(root_plugin, len(found_group)))
+            for p in found_group:
+                f.write("{}\n".format(p))
+        return found_group, "Saved {} plugins to:\n{}\n\nUse Import to bisect this group.".format(len(found_group), dest)
+
     def get_status_text(self):
         state = self.load_state()
         if not state:
@@ -1249,6 +1283,11 @@ class ModBisectDialog(QDialog):
         self.import_btn.setStyleSheet("font-size: 13px; padding: 8px;")
         self.import_btn.clicked.connect(self._on_import)
         setup_layout.addWidget(self.import_btn)
+        self.export_group_btn = QPushButton("Export Group")
+        self.export_group_btn.setToolTip("Export all plugins in a dependency group to a file (e.g. WorkshopFramework.esm)")
+        self.export_group_btn.setStyleSheet("font-size: 13px; padding: 8px;")
+        self.export_group_btn.clicked.connect(self._on_export_group)
+        setup_layout.addWidget(self.export_group_btn)
         layout.addWidget(setup_group)
 
         # Report result buttons
@@ -1370,6 +1409,20 @@ class ModBisectDialog(QDialog):
             QApplication.processEvents()
             sb = self.log_text.verticalScrollBar()
             sb.setValue(sb.maximum())
+
+    def _on_export_group(self):
+        from PyQt6.QtWidgets import QInputDialog
+        plugin, ok = QInputDialog.getText(
+            self, "Export Dependency Group",
+            "Enter the root plugin name (e.g. WorkshopFramework.esm).\n"
+            "All plugins connected to it by masters will be exported.")
+        if not ok or not plugin.strip():
+            return
+        group, msg = self.engine.export_group(plugin.strip())
+        if group is None:
+            QMessageBox.warning(self, "Not Found", msg)
+        else:
+            QMessageBox.information(self, "Exported", msg)
 
     def _on_import(self):
         path, _ = QFileDialog.getOpenFileName(
