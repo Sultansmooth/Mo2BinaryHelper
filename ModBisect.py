@@ -614,9 +614,14 @@ class BisectEngine:
 
         first_test = {"indices": half_a, "label": "A"}
 
+        # Remove cascade plugins from testable — they're always off during bisection
+        # (they have 5+ testable masters and would shield those masters from being disabled)
+        cascade_lower = {c.lower() for c in cascade}
+        testable_active = [p for p in testable if p.lower() not in cascade_lower]
+
         state = {
             "base_plugins": base,
-            "all_testable": testable,
+            "all_testable": testable_active,
             "groups": groups,
             "cascade": cascade,
             "all_deps": deps,
@@ -757,9 +762,13 @@ class BisectEngine:
         work_queue = [{"indices": half_b, "label": "B"}]
         first_test = {"indices": half_a, "label": "A"}
 
+        # Remove cascade plugins from testable — always off during bisection
+        cascade_lower = {c.lower() for c in cascade}
+        testable_active = [p for p in testable if p.lower() not in cascade_lower]
+
         state = {
             "base_plugins": base,
-            "all_testable": testable,
+            "all_testable": testable_active,
             "groups": groups,
             "cascade": cascade,
             "all_deps": deps,
@@ -955,7 +964,6 @@ class BisectEngine:
 
         test = state["current_test"]
         indices = test["indices"]
-        crash_count = test.get("crash_count", 0) + 1
 
         state["round"] += 1
 
@@ -973,9 +981,9 @@ class BisectEngine:
             "cost": "CRASHED",
         })
 
-        # Try to split instead of quarantine (unless too small or crashed twice)
+        # Try to split instead of quarantine (unless too small to split)
         can_split = False
-        if crash_count < 2 and len(indices) > self.THRESHOLD:
+        if len(indices) > self.THRESHOLD:
             sub_a, sub_b = self._split_by_plugin_count(indices, groups)
             if sub_b:
                 can_split = True
@@ -983,8 +991,8 @@ class BisectEngine:
                 b_count = sum(len(groups[i]) for i in sub_b)
                 self.append_log("Round {} -- Disabled {} CRASHED ({} plugins off) -> splitting into smaller halves".format(
                     state["round"], test["label"], len(crash_plugins)))
-                self.append_log("  Crash #{} -- trying {}.A ({} plugins) and {}.B ({} plugins) separately".format(
-                    crash_count, test["label"], a_count, test["label"], b_count))
+                self.append_log("  Trying {}.A ({} plugins) and {}.B ({} plugins) separately".format(
+                    test["label"], a_count, test["label"], b_count))
                 # Queue both sub-halves for testing
                 state["work_queue"].append(
                     {"indices": sub_a, "label": test["label"] + ".A"})
@@ -1519,7 +1527,9 @@ class ModBisectDialog(QDialog):
                         disabled += 1
                         continue
                 f.write(line)
-        self.engine.sync_modlist([])  # will disable mods with no enabled plugins
+        # Sync left pane: read current enabled plugins from the file we just wrote
+        remaining_enabled = self.engine.read_enabled_plugins()
+        self.engine.sync_modlist(remaining_enabled)
         self._try_refresh_mo2()
         self.engine.append_log("Disabled {} suspect plugins.".format(disabled))
         QMessageBox.information(self, "Done",
