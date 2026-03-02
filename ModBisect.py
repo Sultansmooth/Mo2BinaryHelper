@@ -270,7 +270,11 @@ class BisectEngine:
             root = find(s.lower())
             groups.setdefault(root, []).append(s)
 
-        return list(groups.values()), cascade, deps, all_masters, not_found
+        # Sort groups by earliest load order position so "bottom half" = bottom of load order
+        load_order = {s.lower(): i for i, s in enumerate(testable)}
+        sorted_groups = sorted(groups.values(), key=lambda g: min(load_order.get(p.lower(), 9999) for p in g))
+
+        return sorted_groups, cascade, deps, all_masters, not_found
 
     def protect_masters(self, disabled_plugins, all_testable, all_masters, base_set):
         """Prevent disabling plugins that are masters of enabled plugins.
