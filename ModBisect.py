@@ -579,6 +579,7 @@ class BisectEngine:
 
         All testable plugins EXCEPT those in disabled_indices groups are enabled.
         Then protect_masters keeps any disabled plugin that's needed as a master.
+        Also cascade-disables base plugins whose masters are in the disabled set.
         """
         groups = state["groups"]
         all_testable = state.get("all_testable", [])
@@ -595,8 +596,29 @@ class BisectEngine:
         actual_disabled, protected = self.protect_masters(
             disabled_plugins, all_testable, all_masters_map, base_set)
 
-        enabled = [p for p in all_testable if p.lower() not in {d.lower() for d in actual_disabled}]
-        return enabled, actual_disabled, protected
+        disabled_lower = {d.lower() for d in actual_disabled}
+        enabled = [p for p in all_testable if p.lower() not in disabled_lower]
+
+        # Cascade: disable base plugins whose masters are now disabled
+        base_masters = state.get("base_masters", {})
+        if base_masters:
+            disabled_base = set()
+            changed = True
+            while changed:
+                changed = False
+                for bp_lower, masters in base_masters.items():
+                    if bp_lower in disabled_base:
+                        continue
+                    for m in masters:
+                        if m in disabled_lower or m in disabled_base:
+                            disabled_base.add(bp_lower)
+                            changed = True
+                            break
+            active_base = [p for p in base if p.lower() not in disabled_base]
+        else:
+            active_base = base
+
+        return enabled, actual_disabled, protected, active_base
 
     # --- Commands ---
 
@@ -685,11 +707,11 @@ class BisectEngine:
         }
 
         # Compute enabled plugins (all testable minus disabled half)
-        enabled, actual_disabled, protected = self._compute_enabled(state, half_b)
+        enabled, actual_disabled, protected, active_base = self._compute_enabled(state, half_b)
         if protected:
             self.append_log("Protected {} masters from being disabled: {}".format(
                 len(protected), ", ".join(protected[:10])))
-        self.write_plugins(base, enabled)
+        self.write_plugins(active_base, enabled)
 
         self.save_state(state)
 
@@ -718,7 +740,7 @@ class BisectEngine:
         self.build_plugin_to_mod_map(all_plugins)
 
         # Initial split: suspects are testable, everything else is base
-        # Also move excluded frameworks (UFO4P etc.) to base even if in the import
+        # Only exclude game ESMs and explicitly excluded frameworks
         base = []
         testable = []
         excluded_from_import = []
@@ -737,31 +759,16 @@ class BisectEngine:
             else:
                 base.append(p)
 
-        # Safety: move testable plugins to base if any base plugin needs them as master.
-        # Otherwise disabling them during bisect breaks the base plugins.
+        # Build base_masters: for each base plugin, which masters it needs.
+        # Used by _compute_enabled to cascade-disable base dependents when
+        # their masters (testable imports) are disabled during bisection.
         testable_set = {p.lower() for p in testable}
-        needed_by_base = set()
+        base_masters = {}
         for bp in base:
-            for m in self.get_plugin_masters(bp):
-                if m.lower() in testable_set:
-                    needed_by_base.add(m.lower())
-        # Transitively: if a needed plugin itself needs other testable plugins
-        changed = True
-        while changed:
-            changed = False
-            for tp in list(needed_by_base):
-                for m in self.get_plugin_masters(tp):
-                    if m.lower() in testable_set and m.lower() not in needed_by_base:
-                        needed_by_base.add(m.lower())
-                        changed = True
-        if needed_by_base:
-            new_testable = []
-            for p in testable:
-                if p.lower() in needed_by_base:
-                    base.append(p)
-                else:
-                    new_testable.append(p)
-            testable = new_testable
+            masters = self.get_plugin_masters(bp)
+            relevant = [m.lower() for m in masters if m.lower() in testable_set]
+            if relevant:
+                base_masters[bp.lower()] = [m.lower() for m in masters]
 
         if not testable:
             return None, "No matching plugins found in suspect file ({} names loaded).".format(len(suspect_names))
@@ -775,13 +782,9 @@ class BisectEngine:
             self.append_log("Auto-excluded {} imported plugins (frameworks):".format(len(excluded_from_import)))
             for p in excluded_from_import:
                 self.append_log("  [skip] {}".format(p))
-        if needed_by_base:
-            self.append_log("Moved {} imported plugins to base (required by non-imported plugins):".format(
-                len(needed_by_base)))
-            for p in sorted(needed_by_base)[:20]:
-                self.append_log("  [base] {}".format(p))
-            if len(needed_by_base) > 20:
-                self.append_log("  ... and {} more".format(len(needed_by_base) - 20))
+        if base_masters:
+            self.append_log("{} non-imported plugins depend on imported ones (will cascade-disable)".format(
+                len(base_masters)))
         self.append_log("Imported from: {}".format(os.path.basename(suspect_file)))
         self.append_log("Total plugins: {} ({} base, {} testable, {} cascade)".format(
             len(all_plugins), len(base), len(testable) - len(cascade), len(cascade)))
@@ -820,6 +823,7 @@ class BisectEngine:
             "cascade": cascade,
             "all_deps": deps,
             "all_masters": all_masters,
+            "base_masters": base_masters,
             "plugin_to_mod": self._plugin_to_mod,
             "phase": "testing",
             "baseline_fps": baseline_fps,
@@ -832,11 +836,11 @@ class BisectEngine:
             "history": [],
         }
 
-        enabled, actual_disabled, protected = self._compute_enabled(state, half_b)
+        enabled, actual_disabled, protected, active_base = self._compute_enabled(state, half_b)
         if protected:
             self.append_log("Protected {} masters from being disabled: {}".format(
                 len(protected), ", ".join(protected[:10])))
-        self.write_plugins(base, enabled)
+        self.write_plugins(active_base, enabled)
         self.save_state(state)
 
         total_testable = sum(len(g) for g in groups)
@@ -947,11 +951,11 @@ class BisectEngine:
             next_test = state["work_queue"].pop(0)
             next_indices = next_test["indices"]
 
-            enabled, actual_disabled, protected = self._compute_enabled(state, next_indices)
+            enabled, actual_disabled, protected, active_base = self._compute_enabled(state, next_indices)
             if protected:
                 self.append_log("  Protected {} masters: {}".format(
                     len(protected), ", ".join(protected[:5])))
-            self.write_plugins(base, enabled)
+            self.write_plugins(active_base, enabled)
             state["current_test"] = next_test
             state["disabled_indices"] = next_indices
             self.save_state(state)
@@ -1076,11 +1080,11 @@ class BisectEngine:
             next_test = state["work_queue"].pop(0)
             next_indices = next_test["indices"]
 
-            enabled, actual_disabled, protected = self._compute_enabled(state, next_indices)
+            enabled, actual_disabled, protected, active_base = self._compute_enabled(state, next_indices)
             if protected:
                 self.append_log("  Protected {} masters: {}".format(
                     len(protected), ", ".join(protected[:5])))
-            self.write_plugins(base, enabled)
+            self.write_plugins(active_base, enabled)
             state["current_test"] = next_test
             state["disabled_indices"] = next_indices
             self.save_state(state)
