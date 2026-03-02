@@ -510,7 +510,7 @@ class BisectEngine:
             os.remove(self.log_file)
 
     def _auto_save_log(self):
-        """Save the current log to Desktop when bisection completes."""
+        """Save the current log and a clean suspect plugin list to Desktop."""
         if not os.path.exists(self.log_file):
             return
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -518,6 +518,24 @@ class BisectEngine:
         dest = os.path.join(desktop, "bisect_results_{}.txt".format(ts))
         shutil.copy2(self.log_file, dest)
         self.append_log("Results saved to: {}".format(dest))
+        # Also save a clean importable plugin list for re-bisecting
+        state = self.load_state()
+        if state and state.get("culprits"):
+            groups = state.get("groups", [])
+            plugins = []
+            for c in state["culprits"]:
+                for i in c.get("indices", []):
+                    if i < len(groups):
+                        for p in groups[i]:
+                            plugins.append(p)
+            if plugins:
+                list_dest = os.path.join(desktop, "bisect_suspects_{}.txt".format(ts))
+                with open(list_dest, "w", encoding="utf-8") as f:
+                    f.write("# Bisect suspects - import this file to re-bisect\n")
+                    for p in plugins:
+                        f.write("{}\n".format(p))
+                self.append_log("Suspect list saved to: {} ({} plugins — use Import to re-bisect)".format(
+                    list_dest, len(plugins)))
 
     @staticmethod
     def _split_by_plugin_count(indices, groups):
