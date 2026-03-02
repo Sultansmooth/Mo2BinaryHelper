@@ -1311,11 +1311,14 @@ class BisectEngine:
 
 
 class ModBisectDialog(QDialog):
+    MODE_FPS = 0
+    MODE_CRASH = 1
+
     def __init__(self, engine, organizer, parent=None):
         super().__init__(parent)
         self.engine = engine
         self.organizer = organizer
-        self.setWindowTitle("Mod Bisect v4 - Find FPS Killers")
+        self.setWindowTitle("Mod Bisect v4")
         self.setMinimumWidth(580)
         self.setMinimumHeight(560)
         self._build_ui()
@@ -1333,6 +1336,19 @@ class ModBisectDialog(QDialog):
             "background: #1e1e2e; color: #cdd6f4; padding: 12px; border-radius: 6px;")
         self.status_label.setMaximumHeight(220)
         layout.addWidget(self.status_label)
+
+        # Mode selector
+        from PyQt6.QtWidgets import QComboBox
+        mode_layout = QHBoxLayout()
+        mode_layout.addWidget(QLabel("Mode:"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("FPS — find plugins killing framerate")
+        self.mode_combo.addItem("Crash — find plugins causing crashes")
+        self.mode_combo.setStyleSheet("font-size: 12px; padding: 4px;")
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        mode_layout.addWidget(self.mode_combo)
+        mode_layout.addStretch()
+        layout.addLayout(mode_layout)
 
         # Quick guide
         self.guide_toggle = QPushButton(">> Quick Guide")
@@ -1361,14 +1377,16 @@ class ModBisectDialog(QDialog):
         # Setup group — baseline FPS inputs
         setup_group = QGroupBox("Start Bisection")
         setup_layout = QHBoxLayout(setup_group)
-        setup_layout.addWidget(QLabel("Good FPS:"))
+        self.good_fps_label = QLabel("Good FPS:")
+        setup_layout.addWidget(self.good_fps_label)
         self.baseline_input = QSpinBox()
         self.baseline_input.setRange(1, 999)
         self.baseline_input.setValue(150)
         self.baseline_input.setToolTip("FPS with no mods / known good state")
         self.baseline_input.setStyleSheet("font-size: 14px; padding: 4px; min-width: 70px;")
         setup_layout.addWidget(self.baseline_input)
-        setup_layout.addWidget(QLabel("Bad FPS:"))
+        self.bad_fps_label = QLabel("Bad FPS:")
+        setup_layout.addWidget(self.bad_fps_label)
         self.allon_input = QSpinBox()
         self.allon_input.setRange(1, 999)
         self.allon_input.setValue(50)
@@ -1487,6 +1505,7 @@ class ModBisectDialog(QDialog):
 
         self.setup_btn.setEnabled(not has_state)
         self.import_btn.setEnabled(not has_state)
+        self.mode_combo.setEnabled(not has_state)
         self.baseline_input.setEnabled(not has_state)
         self.allon_input.setEnabled(not has_state)
         self.good_btn.setEnabled(in_progress)
@@ -1564,21 +1583,23 @@ class ModBisectDialog(QDialog):
             "Text files (*.txt);;All files (*)")
         if not path:
             return
-        baseline = self.baseline_input.value()
-        allon = self.allon_input.value()
-        if baseline <= allon:
+        baseline, allon = self._get_fps_values()
+        is_crash = self.mode_combo.currentIndex() == self.MODE_CRASH
+        if not is_crash and baseline <= allon:
             QMessageBox.warning(self, "Error",
                 "Good FPS ({}) must be higher than Bad FPS ({}).".format(baseline, allon))
             return
         # Count lines for confirmation
         with open(path, "r", encoding="utf-8-sig") as f:
             count = sum(1 for line in f if line.strip() and not line.strip().startswith("#"))
+        if is_crash:
+            confirm_msg = "File: {}\nPlugins: {}\n\nBisect these plugins to find the crash source.\nContinue?".format(
+                os.path.basename(path), count)
+        else:
+            confirm_msg = "File: {}\nPlugins: {}\nGood FPS: {} | Bad FPS: {}\n\nOnly these plugins will be bisected.\nEverything else stays enabled as base.\nContinue?".format(
+                os.path.basename(path), count, baseline, allon)
         reply = QMessageBox.question(
-            self, "Import Suspects",
-            "File: {}\nPlugins: {}\nGood FPS: {} | Bad FPS: {}\n\n"
-            "Only these plugins will be bisected.\n"
-            "Everything else stays enabled as base.\nContinue?".format(
-                os.path.basename(path), count, baseline, allon),
+            self, "Import Suspects", confirm_msg,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply != QMessageBox.StandardButton.Yes:
             return
@@ -1586,26 +1607,41 @@ class ModBisectDialog(QDialog):
         if state is None:
             QMessageBox.warning(self, "Error", msg)
         else:
-            QMessageBox.information(self, "Import Started",
-                msg + "\n\nLaunch game and report result.")
+            if is_crash:
+                follow_up = "\n\nLaunch game. Stable = click Stable. Crash = click Still Crashes."
+            else:
+                follow_up = "\n\nLaunch game and report result."
+            QMessageBox.information(self, "Import Started", msg + follow_up)
             self._try_refresh_mo2()
         self._refresh()
 
+    def _get_fps_values(self):
+        """Get baseline/all_on FPS. In crash mode, use fixed values."""
+        if self.mode_combo.currentIndex() == self.MODE_CRASH:
+            return 150, 50
+        return self.baseline_input.value(), self.allon_input.value()
+
     def _on_setup(self):
-        baseline = self.baseline_input.value()
-        allon = self.allon_input.value()
-        if baseline <= allon:
+        baseline, allon = self._get_fps_values()
+        is_crash = self.mode_combo.currentIndex() == self.MODE_CRASH
+        if not is_crash and baseline <= allon:
             QMessageBox.warning(self, "Error",
                 "Good FPS ({}) must be higher than Bad FPS ({}).".format(baseline, allon))
             return
+        if is_crash:
+            confirm_msg = (
+                "This will back up your files and start bisecting\n"
+                "your entire load order to find crash-causing plugins.\n\n"
+                "Continue?")
+        else:
+            confirm_msg = (
+                "Good FPS: {}  |  Bad FPS: {}\n"
+                "FPS cost to find: {} FPS\n\n"
+                "This will back up your files and start bisecting\n"
+                "your entire load order (subtractive — disables halves).\n"
+                "Continue?".format(baseline, allon, baseline - allon))
         reply = QMessageBox.question(
-            self, "Start Bisection",
-            "Good FPS: {}  |  Bad FPS: {}\n"
-            "FPS cost to find: {} FPS\n\n"
-            "This will back up your files and start bisecting\n"
-            "your entire load order (subtractive — disables halves).\n"
-            "Continue?".format(
-                baseline, allon, baseline - allon),
+            self, "Start Bisection", confirm_msg,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply != QMessageBox.StandardButton.Yes:
             return
@@ -1613,9 +1649,11 @@ class ModBisectDialog(QDialog):
         if state is None:
             QMessageBox.warning(self, "Error", msg)
         else:
-            QMessageBox.information(self, "Ready",
-                msg + "\n\nLaunch the game, check your FPS, then\n"
-                "come back and click Good or Bad.")
+            if is_crash:
+                follow_up = "\n\nLaunch the game. If it loads, click Stable. If it crashes, click Still Crashes."
+            else:
+                follow_up = "\n\nLaunch the game, check your FPS, then\ncome back and click Good or Bad."
+            QMessageBox.information(self, "Ready", msg + follow_up)
             self._try_refresh_mo2()
         self._refresh()
 
@@ -1703,6 +1741,45 @@ class ModBisectDialog(QDialog):
         show = self.guide_toggle.isChecked()
         self.guide_text.setVisible(show)
         self.guide_toggle.setText("vv Quick Guide" if show else ">> Quick Guide")
+
+    def _on_mode_changed(self, index):
+        is_crash = index == self.MODE_CRASH
+        # Hide/show FPS inputs
+        self.good_fps_label.setVisible(not is_crash)
+        self.baseline_input.setVisible(not is_crash)
+        self.bad_fps_label.setVisible(not is_crash)
+        self.allon_input.setVisible(not is_crash)
+        # Relabel buttons
+        if is_crash:
+            self.good_btn.setText("Stable")
+            self.good_btn.setToolTip("Game loaded fine! The plugins we disabled were causing the crash.")
+            self.bad_btn.setText("Still Crashes")
+            self.bad_btn.setToolTip("Still crashing. These aren't the problem.")
+            self.crash_btn.setText("CTD on Load")
+            self.guide_text.setText(
+                "1. Click Start or Import List to begin\n"
+                "2. Close this window (state is saved)\n"
+                "3. Launch game from MO2\n"
+                "4. If the game loads — click Stable\n"
+                "5. If it crashes — click Still Crashes\n"
+                "6. Repeat until the crash-causing plugin is found\n"
+                "7. Click Restore when done")
+        else:
+            self.good_btn.setText("Good FPS")
+            self.good_btn.setToolTip("FPS improved! The plugins we disabled were causing the problem.")
+            self.bad_btn.setText("Bad FPS")
+            self.bad_btn.setToolTip("Still bad FPS. These aren't the problem, culprits are in what's still on.")
+            self.crash_btn.setText("Crashed")
+            self.guide_text.setText(
+                "1. Click Start or Import List to begin\n"
+                "2. Close this window (state is saved)\n"
+                "3. Launch game from MO2\n"
+                "4. Open console (~) and type: coc RedRocketExt\n"
+                "5. Wait 30s for cells to load, check your FPS\n"
+                "6. Alt-Tab back to MO2, reopen Mod Bisect\n"
+                "7. Click Good (FPS fixed), Bad (still bad), or Crashed\n"
+                "8. Repeat from step 2 until culprits are found\n"
+                "9. Click Restore when done")
 
     def _toggle_log(self):
         show = self.log_toggle.isChecked()
