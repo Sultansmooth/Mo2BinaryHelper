@@ -1187,11 +1187,12 @@ class ModBisectDialog(QDialog):
         layout.setSpacing(10)
 
         # Status
-        self.status_label = QLabel()
-        self.status_label.setWordWrap(True)
+        self.status_label = QTextEdit()
+        self.status_label.setReadOnly(True)
         self.status_label.setFont(QFont("Consolas", 10))
         self.status_label.setStyleSheet(
             "background: #1e1e2e; color: #cdd6f4; padding: 12px; border-radius: 6px;")
+        self.status_label.setMaximumHeight(220)
         layout.addWidget(self.status_label)
 
         # Setup group — baseline FPS inputs
@@ -1335,7 +1336,7 @@ class ModBisectDialog(QDialog):
                     break
         self.rebisect_btn.setEnabled(is_done and has_large)
 
-        self.status_label.setText(self.engine.get_status_text())
+        self.status_label.setPlainText(self.engine.get_status_text())
         self.log_text.setPlainText(self.engine.read_log())
         if self.log_text.isVisible():
             QApplication.processEvents()
