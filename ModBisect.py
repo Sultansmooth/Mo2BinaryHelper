@@ -470,8 +470,30 @@ class BisectEngine:
         return ""
 
     def clear_log(self):
+        """Archive old log before starting fresh."""
         if os.path.exists(self.log_file):
+            # Archive to Desktop with timestamp
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+            archive = os.path.join(desktop, "bisect_log_{}.txt".format(ts))
+            shutil.copy2(self.log_file, archive)
+            # Also append to a persistent history log in the profile folder
+            history_file = os.path.join(self.profile_dir, "bisect_history.txt")
+            with open(self.log_file, "r", encoding="utf-8", errors="replace") as f:
+                old_content = f.read()
+            with open(history_file, "a", encoding="utf-8") as f:
+                f.write("\n" + old_content + "\n")
             os.remove(self.log_file)
+
+    def _auto_save_log(self):
+        """Save the current log to Desktop when bisection completes."""
+        if not os.path.exists(self.log_file):
+            return
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        dest = os.path.join(desktop, "bisect_results_{}.txt".format(ts))
+        shutil.copy2(self.log_file, dest)
+        self.append_log("Results saved to: {}".format(dest))
 
     @staticmethod
     def _split_by_plugin_count(indices, groups):
@@ -856,14 +878,16 @@ class BisectEngine:
             if state["culprits"]:
                 self.append_log("=== RESULTS ===")
                 total_found = 0
-                for c in sorted(state["culprits"], key=lambda x: x["fps_cost"], reverse=True):
+                for c in sorted(state["culprits"], key=lambda x: x["fps_cost"] if isinstance(x["fps_cost"], (int, float)) else 9999, reverse=True):
                     self.append_log("  -{} FPS: {}".format(
                         c["fps_cost"], ", ".join(c["names"])))
-                    total_found += c["fps_cost"]
+                    if isinstance(c["fps_cost"], (int, float)):
+                        total_found += c["fps_cost"]
                 self.append_log("Total: {} FPS of {} FPS total cost".format(
                     total_found, baseline - state["all_on_fps"]))
                 msg = "Done! Found {} culprit(s). Check the log.".format(
                     len(state["culprits"]))
+                self._auto_save_log()
             else:
                 msg = "Done. No single group costs more than 5 FPS."
                 self.append_log(msg)
@@ -967,6 +991,7 @@ class BisectEngine:
                         c["fps_cost"], ", ".join(c["names"])))
                 msg = "Done! Found {} suspect(s). Check the log.".format(
                     len(state["culprits"]))
+                self._auto_save_log()
             else:
                 msg = "Done. No culprits found."
                 self.append_log(msg)
