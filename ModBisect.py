@@ -1468,7 +1468,8 @@ class ModBisectDialog(QDialog):
         self.good_btn.setEnabled(in_progress)
         self.bad_btn.setEnabled(in_progress)
         self.crash_btn.setEnabled(in_progress)
-        self.restore_btn.setEnabled(has_state)
+        has_backup = os.path.exists(self.engine.plugins_backup)
+        self.restore_btn.setEnabled(has_state or has_backup)
 
         has_suspects = bool(state and state.get("culprits"))
         is_done = has_state and phase == "done"
