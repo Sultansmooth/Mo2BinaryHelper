@@ -410,7 +410,7 @@ class BisectEngine:
         for src, dst in [(self.plugins_file, self.plugins_backup),
                          (self.modlist_file, self.modlist_backup),
                          (self.loadorder_file, self.loadorder_backup)]:
-            if os.path.exists(src) and not os.path.exists(dst):
+            if os.path.exists(src):
                 shutil.copy2(src, dst)
 
     def restore_backups(self):
@@ -422,7 +422,6 @@ class BisectEngine:
                          (self.loadorder_file, self.loadorder_backup)]:
             if os.path.exists(src):
                 shutil.copy2(src, dst)
-                os.remove(src)
         if os.path.exists(self.state_file):
             os.remove(self.state_file)
 
@@ -1197,11 +1196,10 @@ class BisectEngine:
         cascade_count = len(to_disable) - len(from_file)
 
         # Backup current state
-        if not os.path.exists(self.plugins_backup):
-            shutil.copy2(self.plugins_file, self.plugins_backup)
-        if not os.path.exists(self.modlist_backup) and os.path.exists(self.modlist_file):
+        shutil.copy2(self.plugins_file, self.plugins_backup)
+        if os.path.exists(self.modlist_file):
             shutil.copy2(self.modlist_file, self.modlist_backup)
-        if not os.path.exists(self.loadorder_backup) and os.path.exists(self.loadorder_file):
+        if os.path.exists(self.loadorder_file):
             shutil.copy2(self.loadorder_file, self.loadorder_backup)
 
         # Read current plugins.txt, disable matching ones
