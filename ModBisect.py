@@ -18,7 +18,7 @@ from PyQt6.QtGui import QIcon, QFont
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QTextEdit, QMessageBox, QApplication, QFrame,
-    QSpinBox, QGroupBox,
+    QSpinBox, QGroupBox, QFileDialog,
 )
 
 # Base game plugins that should never be disabled
@@ -286,8 +286,16 @@ class BisectEngine:
         while changed:
             changed = False
             for plugin in list(enabled):
-                for master in all_masters.get(plugin, []):
-                    master_l = master.lower()
+                # Check cached masters first, then live API as fallback
+                masters = all_masters.get(plugin, [])
+                if not masters:
+                    # Cached map was empty — try live lookup
+                    orig_name = testable_lower.get(plugin, plugin)
+                    live = self.get_plugin_masters(orig_name)
+                    if live:
+                        masters = [m.lower() for m in live]
+                        all_masters[plugin] = masters  # cache for next pass
+                for master_l in masters:
                     if master_l in base_set:
                         continue  # base plugin, always on
                     if master_l in testable_lower and master_l not in enabled:
@@ -468,6 +476,9 @@ class BisectEngine:
     @staticmethod
     def _split_by_plugin_count(indices, groups):
         """Split indices into two halves balanced by plugin count, not group count."""
+        if len(indices) <= 1:
+            # Can't split a single group — return it as half_a, empty half_b
+            return indices, []
         total = sum(len(groups[i]) for i in indices)
         target = total // 2
         running = 0
@@ -475,13 +486,19 @@ class BisectEngine:
         for idx, i in enumerate(indices):
             running += len(groups[i])
             if running >= target:
-                split_at = idx + 1
+                # Check if splitting before or after this group gives better balance
+                if idx > 0:
+                    before = running - len(groups[i])
+                    after = running
+                    if abs(before - target) < abs(after - target):
+                        split_at = idx
+                    else:
+                        split_at = idx + 1
+                else:
+                    split_at = idx + 1
                 break
         # Ensure both halves are non-empty
-        if split_at >= len(indices):
-            split_at = len(indices) - 1
-        if split_at < 1:
-            split_at = 1
+        split_at = max(1, min(split_at, len(indices) - 1))
         return indices[:split_at], indices[split_at:]
 
     # --- Commands ---
@@ -579,6 +596,147 @@ class BisectEngine:
         self.append_log(msg)
         return state, msg
 
+    def setup_from_list(self, baseline_fps, all_on_fps, suspect_file):
+        """Start bisection using only plugins from a file as testable."""
+        if self.has_state():
+            return None, "Bisection already in progress. Restore first to start over."
+
+        # Read suspect list
+        with open(suspect_file, "r", encoding="utf-8-sig") as f:
+            suspect_names = set()
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    suspect_names.add(line.lower())
+
+        all_plugins = self.read_enabled_plugins()
+        self.build_plugin_to_mod_map(all_plugins)
+
+        # Initial split: suspects are testable, everything else is base
+        # Also move excluded frameworks (UFO4P etc.) to base even if in the import
+        base = []
+        testable = []
+        excluded_from_import = []
+        for p in all_plugins:
+            if p.lower() in suspect_names:
+                if p.lower() in BASE_PLUGINS or self._is_excluded_mod(p):
+                    base.append(p)
+                    excluded_from_import.append(p)
+                else:
+                    mod_folder = self._plugin_to_mod.get(p.lower(), "")
+                    if mod_folder and self._is_excluded_mod(mod_folder):
+                        base.append(p)
+                        excluded_from_import.append(p)
+                    else:
+                        testable.append(p)
+            else:
+                base.append(p)
+
+        # Safety: move testable plugins to base if any base plugin needs them as master.
+        # Otherwise disabling them during bisect breaks the base plugins.
+        testable_set = {p.lower() for p in testable}
+        needed_by_base = set()
+        for bp in base:
+            for m in self.get_plugin_masters(bp):
+                if m.lower() in testable_set:
+                    needed_by_base.add(m.lower())
+        # Transitively: if a needed plugin itself needs other testable plugins
+        changed = True
+        while changed:
+            changed = False
+            for tp in list(needed_by_base):
+                for m in self.get_plugin_masters(tp):
+                    if m.lower() in testable_set and m.lower() not in needed_by_base:
+                        needed_by_base.add(m.lower())
+                        changed = True
+        if needed_by_base:
+            new_testable = []
+            for p in testable:
+                if p.lower() in needed_by_base:
+                    base.append(p)
+                else:
+                    new_testable.append(p)
+            testable = new_testable
+
+        if not testable:
+            return None, "No matching plugins found in suspect file ({} names loaded).".format(len(suspect_names))
+
+        groups, cascade, deps, all_masters, not_found = self.build_dependency_groups(testable)
+
+        self.clear_log()
+        self.append_log("=== MO2 Mod Bisect v3 Started (imported {} suspects) ===".format(len(testable)))
+        self.append_log("Profile: {}".format(os.path.basename(self.profile_dir)))
+        if excluded_from_import:
+            self.append_log("Auto-excluded {} imported plugins (frameworks):".format(len(excluded_from_import)))
+            for p in excluded_from_import:
+                self.append_log("  [skip] {}".format(p))
+        if needed_by_base:
+            self.append_log("Moved {} imported plugins to base (required by non-imported plugins):".format(
+                len(needed_by_base)))
+            for p in sorted(needed_by_base)[:20]:
+                self.append_log("  [base] {}".format(p))
+            if len(needed_by_base) > 20:
+                self.append_log("  ... and {} more".format(len(needed_by_base) - 20))
+        self.append_log("Imported from: {}".format(os.path.basename(suspect_file)))
+        self.append_log("Total plugins: {} ({} base, {} testable, {} cascade)".format(
+            len(all_plugins), len(base), len(testable) - len(cascade), len(cascade)))
+        self.append_log("Baseline: {} FPS | All on: {} FPS | Cost: {} FPS".format(
+            baseline_fps, all_on_fps, baseline_fps - all_on_fps))
+        self.append_log("{} dependency groups".format(len(groups)))
+        if cascade:
+            self.append_log("Cascade (always off): {}".format(", ".join(cascade)))
+        multi = [g for g in groups if len(g) > 1]
+        for g in multi:
+            self.append_log("  Group: {} (+{} deps)".format(g[0], len(g) - 1))
+
+        total_cost = baseline_fps - all_on_fps
+        if total_cost <= 5:
+            msg = "Only {} FPS difference. Nothing significant to find.".format(total_cost)
+            self.append_log(msg)
+            return None, msg
+
+        self.backup_files()
+
+        all_indices = list(range(len(groups)))
+        half_a, half_b = self._split_by_plugin_count(all_indices, groups)
+
+        work_queue = [{"indices": half_b, "label": "B"}]
+        first_test = {"indices": half_a, "label": "A"}
+        plugins = self.order_plugins([groups[i] for i in half_a], deps)
+        base_set = {p.lower() for p in base}
+        plugins, pulled = self.close_under_masters(plugins, testable, all_masters, base_set)
+        if pulled:
+            self.append_log("Pulled in {} extra plugins for masters: {}".format(
+                len(pulled), ", ".join(pulled[:10])))
+        self.write_plugins(base, plugins)
+
+        state = {
+            "base_plugins": base,
+            "all_testable": testable,
+            "groups": groups,
+            "cascade": cascade,
+            "all_deps": deps,
+            "all_masters": all_masters,
+            "plugin_to_mod": self._plugin_to_mod,
+            "phase": "testing",
+            "baseline_fps": baseline_fps,
+            "all_on_fps": all_on_fps,
+            "work_queue": work_queue,
+            "culprits": [],
+            "enabled_indices": half_a,
+            "current_test": first_test,
+            "round": 0,
+            "history": [],
+        }
+        self.save_state(state)
+
+        total_testable = sum(len(g) for g in groups)
+        disabled_count = total_testable - len(plugins)
+        msg = "{} suspects imported, {} testable in {} groups.\nTesting A ({} plugins on, {} off).\nLaunch game and report result.".format(
+            len(testable), total_testable, len(groups), len(plugins), disabled_count)
+        self.append_log(msg)
+        return state, msg
+
     def report_fps(self, fps):
         state = self.load_state()
         if not state:
@@ -622,18 +780,21 @@ class BisectEngine:
             "cost": fps_cost,
         })
 
+        can_split = False
         if fps_cost > 5 and len(indices) > self.THRESHOLD:
             sub_a, sub_b = self._split_by_plugin_count(indices, groups)
-            state["work_queue"].append(
-                {"indices": sub_a, "label": test["label"] + ".A"})
-            state["work_queue"].append(
-                {"indices": sub_b, "label": test["label"] + ".B"})
-            a_count = sum(len(groups[i]) for i in sub_a)
-            b_count = sum(len(groups[i]) for i in sub_b)
-            self.append_log("  BAD FPS → splitting {} into {}.A ({} plugins) and {}.B ({} plugins)".format(
-                test["label"], test["label"], a_count, test["label"], b_count))
+            if sub_b:  # only split if both halves are non-empty
+                can_split = True
+                state["work_queue"].append(
+                    {"indices": sub_a, "label": test["label"] + ".A"})
+                state["work_queue"].append(
+                    {"indices": sub_b, "label": test["label"] + ".B"})
+                a_count = sum(len(groups[i]) for i in sub_a)
+                b_count = sum(len(groups[i]) for i in sub_b)
+                self.append_log("  BAD FPS → splitting {} into {}.A ({} plugins) and {}.B ({} plugins)".format(
+                    test["label"], test["label"], a_count, test["label"], b_count))
 
-        elif fps_cost > 5 and len(indices) <= self.THRESHOLD:
+        if fps_cost > 5 and not can_split:
             group_names = []
             total_in_group = 0
             for i in indices:
@@ -801,7 +962,7 @@ class BisectEngine:
 
             if state["culprits"]:
                 self.append_log("=== RESULTS ===")
-                for c in sorted(state["culprits"], key=lambda x: str(x["fps_cost"]), reverse=True):
+                for c in sorted(state["culprits"], key=lambda x: x["fps_cost"] if isinstance(x["fps_cost"], (int, float)) else 9999, reverse=True):
                     self.append_log("  -{}: {}".format(
                         c["fps_cost"], ", ".join(c["names"])))
                 msg = "Done! Found {} suspect(s). Check the log.".format(
@@ -862,7 +1023,7 @@ class BisectEngine:
             if state.get("culprits"):
                 lines.append("")
                 lines.append("FPS Killers Found:")
-                for c in sorted(state["culprits"], key=lambda x: str(x["fps_cost"]), reverse=True):
+                for c in sorted(state["culprits"], key=lambda x: x["fps_cost"] if isinstance(x["fps_cost"], (int, float)) else 9999, reverse=True):
                     total_in = sum(len(groups[i]) for i in c.get("indices", []) if i < len(groups))
                     if total_in > 20:
                         lines.append("  -{} FPS: {} ({} plugins — add root to excludes, re-run)".format(
@@ -879,16 +1040,16 @@ class BisectEngine:
             for h in state["history"]:
                 fps = h.get("fps", "?")
                 label = h.get("label", "?")
-                groups = h.get("groups", "?")
+                n_grp = h.get("groups", "?")
                 if fps == "CRASH":
                     lines.append("  R{}: {} ({} groups) -> CRASHED (quarantined)".format(
-                        h.get("round", "?"), label, groups))
+                        h.get("round", "?"), label, n_grp))
                 elif h.get("cost", 0) == 0 or (isinstance(h.get("cost"), (int, float)) and h["cost"] <= 5):
                     lines.append("  R{}: {} ({} groups) -> {} FPS CLEAN".format(
-                        h.get("round", "?"), label, groups, fps))
+                        h.get("round", "?"), label, n_grp, fps))
                 else:
                     lines.append("  R{}: {} ({} groups) -> {} FPS BAD (cost {})".format(
-                        h.get("round", "?"), label, groups, fps, h.get("cost", "?")))
+                        h.get("round", "?"), label, n_grp, fps, h.get("cost", "?")))
 
         return "\n".join(lines)
 
@@ -937,6 +1098,11 @@ class ModBisectDialog(QDialog):
         self.setup_btn.setStyleSheet("font-size: 13px; padding: 8px;")
         self.setup_btn.clicked.connect(self._on_setup)
         setup_layout.addWidget(self.setup_btn)
+        self.import_btn = QPushButton("Import List")
+        self.import_btn.setToolTip("Load a .txt file of plugin names to bisect only those")
+        self.import_btn.setStyleSheet("font-size: 13px; padding: 8px;")
+        self.import_btn.clicked.connect(self._on_import)
+        setup_layout.addWidget(self.import_btn)
         layout.addWidget(setup_group)
 
         # Report result buttons
@@ -1027,6 +1193,7 @@ class ModBisectDialog(QDialog):
         in_progress = has_state and phase not in ("done", "")
 
         self.setup_btn.setEnabled(not has_state)
+        self.import_btn.setEnabled(not has_state)
         self.baseline_input.setEnabled(not has_state)
         self.allon_input.setEnabled(not has_state)
         self.good_btn.setEnabled(in_progress)
@@ -1055,6 +1222,39 @@ class ModBisectDialog(QDialog):
             QApplication.processEvents()
             sb = self.log_text.verticalScrollBar()
             sb.setValue(sb.maximum())
+
+    def _on_import(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Suspect Plugin List", os.path.expanduser("~/Desktop"),
+            "Text files (*.txt);;All files (*)")
+        if not path:
+            return
+        baseline = self.baseline_input.value()
+        allon = self.allon_input.value()
+        if baseline <= allon:
+            QMessageBox.warning(self, "Error",
+                "Good FPS ({}) must be higher than Bad FPS ({}).".format(baseline, allon))
+            return
+        # Count lines for confirmation
+        with open(path, "r", encoding="utf-8-sig") as f:
+            count = sum(1 for line in f if line.strip() and not line.strip().startswith("#"))
+        reply = QMessageBox.question(
+            self, "Import Suspects",
+            "File: {}\nPlugins: {}\nGood FPS: {} | Bad FPS: {}\n\n"
+            "Only these plugins will be bisected.\n"
+            "Everything else stays enabled as base.\nContinue?".format(
+                os.path.basename(path), count, baseline, allon),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        state, msg = self.engine.setup_from_list(baseline, allon, path)
+        if state is None:
+            QMessageBox.warning(self, "Error", msg)
+        else:
+            QMessageBox.information(self, "Import Started",
+                msg + "\n\nLaunch game and report result.")
+            self._try_refresh_mo2()
+        self._refresh()
 
     def _on_setup(self):
         baseline = self.baseline_input.value()
