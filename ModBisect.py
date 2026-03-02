@@ -1127,8 +1127,8 @@ class BisectEngine:
         """Build dependency groups from current load order and export the group
         containing root_plugin to a file on the Desktop."""
         enabled = self.read_enabled_plugins()
-        base = [p for p in enabled if p.lower() in BASE_PLUGINS or self._is_excluded(p)]
-        testable = [p for p in enabled if p not in base]
+        self.build_plugin_to_mod_map(enabled)
+        base, testable, excluded_mods = self.classify_plugins(enabled)
         groups, cascade, deps, all_masters, not_found = self.build_dependency_groups(testable)
 
         # Find the group containing root_plugin
@@ -1142,8 +1142,7 @@ class BisectEngine:
         if found_group is None:
             for p in cascade:
                 if p.lower() == root_lower:
-                    # Root is in cascade — collect all cascade plugins that share it
-                    found_group = [p for p in cascade]
+                    found_group = list(cascade)
                     break
         if found_group is None:
             return None, "Plugin '{}' not found in any dependency group.\nMake sure it's enabled in your load order.".format(root_plugin)
@@ -1418,11 +1417,14 @@ class ModBisectDialog(QDialog):
             "All plugins connected to it by masters will be exported.")
         if not ok or not plugin.strip():
             return
-        group, msg = self.engine.export_group(plugin.strip())
-        if group is None:
-            QMessageBox.warning(self, "Not Found", msg)
-        else:
-            QMessageBox.information(self, "Exported", msg)
+        try:
+            group, msg = self.engine.export_group(plugin.strip())
+            if group is None:
+                QMessageBox.warning(self, "Not Found", msg)
+            else:
+                QMessageBox.information(self, "Exported", msg)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", "Export failed:\n{}".format(e))
 
     def _on_import(self):
         path, _ = QFileDialog.getOpenFileName(
