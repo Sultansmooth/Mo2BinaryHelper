@@ -1156,6 +1156,51 @@ class BisectEngine:
                 f.write("{}\n".format(p))
         return found_group, "Saved {} plugins to:\n{}\n\nUse Import to bisect this group.".format(len(found_group), dest)
 
+    def disable_from_file(self, list_path):
+        """Disable all plugins listed in a .txt file. Backs up first."""
+        with open(list_path, "r", encoding="utf-8-sig") as f:
+            to_disable = set()
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    to_disable.add(line.lower())
+        if not to_disable:
+            return 0, "No plugins found in file."
+
+        # Backup current state
+        if not os.path.exists(self.plugins_backup):
+            shutil.copy2(self.plugins_file, self.plugins_backup)
+        if not os.path.exists(self.modlist_backup) and os.path.exists(self.modlist_file):
+            shutil.copy2(self.modlist_file, self.modlist_backup)
+
+        # Read current plugins.txt, disable matching ones
+        with open(self.plugins_file, "r", encoding="utf-8-sig") as f:
+            lines = f.readlines()
+
+        disabled_count = 0
+        enabled_plugins = []
+        with open(self.plugins_file, "w", encoding="utf-8") as f:
+            for line in lines:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    f.write(line)
+                    continue
+                was_enabled = stripped.startswith("*")
+                name = stripped[1:] if was_enabled else stripped
+                if name.lower() in to_disable and was_enabled:
+                    f.write("{}\n".format(name))  # remove * prefix
+                    disabled_count += 1
+                else:
+                    f.write(line)
+                    if was_enabled:
+                        enabled_plugins.append(name)
+
+        # Sync left pane
+        self.build_plugin_to_mod_map(enabled_plugins)
+        self.sync_modlist(enabled_plugins)
+        return disabled_count, "Disabled {} of {} plugins.\nBackup saved — use Restore to undo.".format(
+            disabled_count, len(to_disable))
+
     def get_status_text(self):
         state = self.load_state()
         if not state:
@@ -1287,6 +1332,11 @@ class ModBisectDialog(QDialog):
         self.export_group_btn.setStyleSheet("font-size: 13px; padding: 8px;")
         self.export_group_btn.clicked.connect(self._on_export_group)
         setup_layout.addWidget(self.export_group_btn)
+        self.disable_list_btn = QPushButton("Disable List")
+        self.disable_list_btn.setToolTip("Disable all plugins in a .txt file (backs up first, use Restore to undo)")
+        self.disable_list_btn.setStyleSheet("font-size: 13px; padding: 8px;")
+        self.disable_list_btn.clicked.connect(self._on_disable_list)
+        setup_layout.addWidget(self.disable_list_btn)
         layout.addWidget(setup_group)
 
         # Report result buttons
@@ -1425,6 +1475,30 @@ class ModBisectDialog(QDialog):
                 QMessageBox.information(self, "Exported", msg)
         except Exception as e:
             QMessageBox.critical(self, "Error", "Export failed:\n{}".format(e))
+
+    def _on_disable_list(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Plugin List to Disable", os.path.expanduser("~/Desktop"),
+            "Text files (*.txt);;All files (*)")
+        if not path:
+            return
+        with open(path, "r", encoding="utf-8-sig") as f:
+            count = sum(1 for line in f if line.strip() and not line.strip().startswith("#"))
+        reply = QMessageBox.question(
+            self, "Disable Plugins",
+            "Disable {} plugins from:\n{}\n\n"
+            "Current state will be backed up.\n"
+            "Use Restore to undo.".format(count, os.path.basename(path)),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            disabled, msg = self.engine.disable_from_file(path)
+            QMessageBox.information(self, "Done", msg)
+            self._try_refresh_mo2()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", "Disable failed:\n{}".format(e))
+        self._refresh()
 
     def _on_import(self):
         path, _ = QFileDialog.getOpenFileName(
