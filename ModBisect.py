@@ -1334,6 +1334,30 @@ class ModBisectDialog(QDialog):
         self.status_label.setMaximumHeight(220)
         layout.addWidget(self.status_label)
 
+        # Quick guide
+        self.guide_toggle = QPushButton(">> Quick Guide")
+        self.guide_toggle.setStyleSheet(
+            "font-weight: bold; font-size: 11px; padding: 4px; text-align: left; border: none;")
+        self.guide_toggle.setCheckable(True)
+        self.guide_toggle.setChecked(False)
+        self.guide_toggle.clicked.connect(self._toggle_guide)
+        layout.addWidget(self.guide_toggle)
+        self.guide_text = QLabel(
+            "1. Click Start or Import List to begin\n"
+            "2. Close this window (state is saved)\n"
+            "3. Launch game from MO2\n"
+            "4. Open console (~) and type: coc RedRocketExt\n"
+            "5. Wait 30s for cells to load, check your FPS\n"
+            "6. Alt-Tab back to MO2, reopen Mod Bisect\n"
+            "7. Click Good (FPS fixed), Bad (still bad), or Crashed\n"
+            "8. Repeat from step 2 until culprits are found\n"
+            "9. Click Restore when done")
+        self.guide_text.setStyleSheet(
+            "background: #313244; color: #a6adc8; padding: 10px; border-radius: 4px; font-size: 11px;")
+        self.guide_text.setWordWrap(True)
+        self.guide_text.setVisible(False)
+        layout.addWidget(self.guide_text)
+
         # Setup group — baseline FPS inputs
         setup_group = QGroupBox("Start Bisection")
         setup_layout = QHBoxLayout(setup_group)
@@ -1674,6 +1698,11 @@ class ModBisectDialog(QDialog):
             self.organizer.refresh()
         except Exception:
             pass
+
+    def _toggle_guide(self):
+        show = self.guide_toggle.isChecked()
+        self.guide_text.setVisible(show)
+        self.guide_toggle.setText("vv Quick Guide" if show else ">> Quick Guide")
 
     def _toggle_log(self):
         show = self.log_toggle.isChecked()
