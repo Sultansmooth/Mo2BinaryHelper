@@ -1157,15 +1157,44 @@ class BisectEngine:
         return found_group, "Saved {} plugins to:\n{}\n\nUse Import to bisect this group.".format(len(found_group), dest)
 
     def disable_from_file(self, list_path):
-        """Disable all plugins listed in a .txt file. Backs up first."""
+        """Disable all plugins listed in a .txt file, plus any dependents
+        that would have missing masters. Backs up first."""
         with open(list_path, "r", encoding="utf-8-sig") as f:
-            to_disable = set()
+            from_file = set()
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#"):
-                    to_disable.add(line.lower())
-        if not to_disable:
+                    from_file.add(line.lower())
+        if not from_file:
             return 0, "No plugins found in file."
+
+        # Read all currently enabled plugins
+        enabled = self.read_enabled_plugins()
+        enabled_lower = {p.lower(): p for p in enabled}
+
+        # Build masters map for all enabled plugins
+        self.build_plugin_to_mod_map(enabled)
+        masters_map = {}  # plugin_lower -> [master_lower, ...]
+        for p in enabled:
+            masters = self.get_plugin_masters(p)
+            if masters:
+                masters_map[p.lower()] = [m.lower() for m in masters]
+
+        # Cascade: find all dependents that would have missing masters
+        to_disable = set(from_file)
+        changed = True
+        while changed:
+            changed = False
+            for p_lower, masters in masters_map.items():
+                if p_lower in to_disable:
+                    continue
+                for m in masters:
+                    if m in to_disable and m in enabled_lower:
+                        to_disable.add(p_lower)
+                        changed = True
+                        break
+
+        cascade_count = len(to_disable) - len(from_file)
 
         # Backup current state
         if not os.path.exists(self.plugins_backup):
@@ -1178,7 +1207,7 @@ class BisectEngine:
             lines = f.readlines()
 
         disabled_count = 0
-        enabled_plugins = []
+        still_enabled = []
         with open(self.plugins_file, "w", encoding="utf-8") as f:
             for line in lines:
                 stripped = line.strip()
@@ -1193,13 +1222,17 @@ class BisectEngine:
                 else:
                     f.write(line)
                     if was_enabled:
-                        enabled_plugins.append(name)
+                        still_enabled.append(name)
 
         # Sync left pane
-        self.build_plugin_to_mod_map(enabled_plugins)
-        self.sync_modlist(enabled_plugins)
-        return disabled_count, "Disabled {} of {} plugins.\nBackup saved — use Restore to undo.".format(
-            disabled_count, len(to_disable))
+        self.sync_modlist(still_enabled)
+
+        msg = "Disabled {} plugins".format(disabled_count)
+        if cascade_count > 0:
+            msg += " ({} from file + {} dependents)".format(
+                disabled_count - cascade_count, cascade_count)
+        msg += ".\nBackup saved — use Restore to undo."
+        return disabled_count, msg
 
     def get_status_text(self):
         state = self.load_state()
