@@ -39,6 +39,7 @@ DEFAULT_EXCLUDE_PATTERNS = [
     "addictol",
     "buffout",
     "classic holstered",
+    "classicholstered",
     "unofficial fallout 4 patch",
 ]
 
